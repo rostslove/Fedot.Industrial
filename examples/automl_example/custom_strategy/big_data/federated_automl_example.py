@@ -6,8 +6,11 @@ from fedot_ind.tools.synthetic.ts_datasets_generator import TimeSeriesDatasetsGe
 
 def run_federated_automl_example(timeout: int = 10):
     industrial_config = {'problem': 'classification',
-                         'data_type': 'time_series',
-                         'learning_strategy': 'federated_automl'}
+                         'learning_strategy': 'federated_automl',
+                         'strategy': 'federated_automl',
+                         'strategy_params': {'timeout': timeout, 
+                                              'data_type': 'time_series',
+                                              'problem': 'classification'}}
 
     learning_config = {'learning_strategy': 'from_scratch',
                        'learning_strategy_params': {**DEFAULT_AUTOML_LEARNING_CONFIG, 'timeout': timeout},

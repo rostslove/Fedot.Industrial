@@ -8,7 +8,7 @@ from fedot.core.repository.dataset_types import DataTypesEnum
 
 from fedot_ind.core.architecture.settings.computational import backend_methods as np
 from fedot_ind.core.repository.constanst_repository import FEDOT_ATOMIZE_OPERATION, FEDOT_HEAD_ENSEMBLE, FEDOT_TASK
-from fedot_ind.core.repository.model_repository import SKLEARN_CLF_MODELS, SKLEARN_REG_MODELS
+from fedot_ind.core.repository.model_repository import SKLEARN_CLF_MODELS, SKLEARN_REG_MODELS, default_industrial_availiable_operation
 
 
 class RAFEnsembler:
@@ -34,6 +34,12 @@ class RAFEnsembler:
 
         self.ensemble_method = self._raf_ensemble
         self.atomized_automl_params = composing_params
+        if 'available_operations' not in self.atomized_automl_params:
+            self.atomized_automl_params['available_operations'] = default_industrial_availiable_operation(self.problem)
+        keys_to_remove = ['data_type']
+        for key in keys_to_remove:
+            if key in self.atomized_automl_params:
+                del self.atomized_automl_params[key]
         self.n_splits = n_splits
         self.batch_size = batch_size
 

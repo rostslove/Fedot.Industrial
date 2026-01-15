@@ -248,13 +248,15 @@ class FedotIndustrial(Fedot):
 
         """
 
-        def fit_function(train_data): return \
-            Either(value=train_data, monoid=[train_data,
+        def fit_function(train_data): 
+            # return \
+            # Either(value=train_data, monoid=[train_data,
 
-                                             not isinstance(self.manager.industrial_config.strategy, Callable)]). \
-            either(left_function=lambda data: self.manager.industrial_config.strategy.fit(data),
-                   right_function=lambda data: self.manager.solver.fit(data))
-
+            #                                  not isinstance(self.manager.industrial_config.strategy, Callable)]). \
+            # either(left_function=lambda data: self.manager.industrial_config.strategy.fit(data),
+            #        right_function=lambda data: self.manager.solver.fit(data))
+            return self.manager.industrial_config.strategy.fit(train_data)
+        
         with exception_handler(Exception, on_exception=self.shutdown, suppress=False):
             Either.insert(self._process_input_data(input_data)). \
                 then(lambda data: self.__init_industrial_backend(data)). \

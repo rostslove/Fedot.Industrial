@@ -96,7 +96,7 @@ class IndustrialStrategy:
             input_data, predict_mode)
 
     def _federated_strategy(self, input_data):
-
+        print('federated entry')
         n_samples = input_data.features.shape[0]
         if n_samples > BATCH_SIZE_FOR_FEDOT_WORKER:
             self.logger.info('RAF algorithm was applied')
@@ -106,12 +106,12 @@ class IndustrialStrategy:
             batch_size = round(input_data.features.shape[0] / self.RAF_workers)
 
             min_timeout = 0.5
-            selected_timeout = round(self.config['timeout'] / FEDOT_WORKER_TIMEOUT_PARTITION)
-            self.config['timeout'] = max(min_timeout, selected_timeout)
+            selected_timeout = round(self.industrial_strategy_params['timeout'] / FEDOT_WORKER_TIMEOUT_PARTITION)
+            self.industrial_strategy_params['timeout'] = max(min_timeout, selected_timeout)
 
             self.logger.info(f'Batch_size - {batch_size}. Number of batches - {self.RAF_workers}')
 
-            self.solver = RAFEnsembler(composing_params=self.config,
+            self.solver = RAFEnsembler(composing_params=self.industrial_strategy_params,
                                        n_splits=self.RAF_workers,
                                        batch_size=batch_size)
             self.logger.info(
