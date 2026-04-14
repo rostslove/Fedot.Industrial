@@ -7,18 +7,36 @@ from fedot.core.pipelines.pipeline_builder import PipelineBuilder
 from fedot.core.repository.dataset_types import DataTypesEnum
 
 from fedot_ind.core.architecture.settings.computational import backend_methods as np
+from fedot_ind.core.operation.partitioning import FeatureSpacePartitioner
 from fedot_ind.core.repository.constanst_repository import FEDOT_ATOMIZE_OPERATION, FEDOT_HEAD_ENSEMBLE, FEDOT_TASK
 from fedot_ind.core.repository.model_repository import SKLEARN_CLF_MODELS, SKLEARN_REG_MODELS, default_industrial_availiable_operation
 
 
 class RAFEnsembler:
-    """Class for ensemble of random automl forest
+    """Ensemble of independently-optimised AutoML pipelines (Random AutoML Forest).
+
+    The training dataset is partitioned into ``n_splits`` disjoint subsets.
+    Each subset is handled by a separate FEDOT AutoML worker that discovers
+    its own best pipeline.  A head model (e.g. XGBoost) combines the
+    outputs of all workers into the final prediction.
 
     Args:
-        composing_params: dict with parameters for ensemble
-        n_splits: number of splits for ensemble
-        batch_size: size of batch for ensemble
+        composing_params: dict with parameters for ensemble.  Recognised
+            keys include ``problem``, ``timeout``, ``available_operations``,
+            and ``partitioning_method`` / ``partitioning_params``.
+        n_splits: number of data partitions (workers).
+        batch_size: approximate samples per partition when ``n_splits``
+            is not specified explicitly.
 
+    Partitioning methods (``composing_params['partitioning_method']``):
+
+    * ``'sequential'`` -- equal-sized sequential chunks (**default**,
+      original behaviour).
+    * ``'kmeans'`` -- K-Means clustering in feature space.
+    * ``'dbscan'`` -- DBSCAN density-based clustering.
+
+    Additional clustering parameters can be passed via
+    ``composing_params['partitioning_params']`` dict.
     """
 
     def __init__(self,
@@ -33,9 +51,16 @@ class RAFEnsembler:
         self.head = FEDOT_HEAD_ENSEMBLE[composing_params['problem']]
 
         self.ensemble_method = self._raf_ensemble
-        self.atomized_automl_params = composing_params
+        self.atomized_automl_params = deepcopy(composing_params)
         if 'available_operations' not in self.atomized_automl_params:
             self.atomized_automl_params['available_operations'] = default_industrial_availiable_operation(self.problem)
+
+        # extract partitioning config before cleaning params
+        self.partitioning_method = self.atomized_automl_params.pop(
+            'partitioning_method', 'sequential')
+        self.partitioning_params = self.atomized_automl_params.pop(
+            'partitioning_params', {})
+
         keys_to_remove = ['data_type']
         for key in keys_to_remove:
             if key in self.atomized_automl_params:
@@ -43,30 +68,40 @@ class RAFEnsembler:
         self.n_splits = n_splits
         self.batch_size = batch_size
 
-    def _decompose_pipeline(self):
-        batch_pipe = [automl_branch.fitted_operation.model.current_pipeline.root_node for automl_branch in
-                      self.current_pipeline.nodes if automl_branch.name in FEDOT_ATOMIZE_OPERATION.values()]
-        self.ensemble_branches = batch_pipe
-        self.ensemble_head = self.current_pipeline.nodes[0]
-        self.ensemble_head.nodes_from = self.ensemble_branches
-        self.current_pipeline = Pipeline(self.ensemble_head)
-
     def fit(self, train_data):
         if self.n_splits is None:
             self.n_splits = round(train_data.features.shape[0] / self.batch_size)
 
-        new_features = np.array_split(train_data.features,
-                                      self.n_splits)
-        new_target = np.array_split(train_data.target,
-                                    self.n_splits)
+        partitioner = FeatureSpacePartitioner.create(
+            method=self.partitioning_method,
+            n_splits=self.n_splits,
+            params=self.partitioning_params)
+
+        new_features, new_target = partitioner.partition(
+            train_data.features, train_data.target)
+
+        # DBSCAN may produce a different number of partitions
+        self.n_splits = len(new_features)
 
         self.current_pipeline = self.ensemble_method(new_features,
                                                      new_target,
                                                      n_splits=self.n_splits)
-        self._decompose_pipeline()
 
     def predict(self, test_data, output_mode: str = 'labels'):
-        return self.current_pipeline.predict(test_data, output_mode).predict
+        test_multimodal = self._to_multimodal(test_data)
+        return self.current_pipeline.predict(test_multimodal, output_mode).predict
+
+    def _to_multimodal(self, input_data):
+        """Convert InputData to MultiModalData matching the training format."""
+        data_dict = {}
+        for i in range(self.n_splits):
+            fold_data = InputData(idx=input_data.idx,
+                                  features=input_data.features,
+                                  target=input_data.target,
+                                  task=self.task,
+                                  data_type=DataTypesEnum.image)
+            data_dict[f'data_source_img/{i}'] = fold_data
+        return MultiModalData(data_dict)
 
     def _raf_ensemble(self, features, target, n_splits):
         raf_ensemble = PipelineBuilder()

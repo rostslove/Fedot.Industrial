@@ -243,8 +243,8 @@ class TensorConverter:
             else:
                 return torch.from_numpy(data.values)
         elif isinstance(data, InputData) and isinstance(data.features, np.ndarray):
-            return torch.from_numpy(data.features)
-        elif isinstance(data, InputData) and isinstance(data.features, np.ndarray):
+            if data.features.dtype == object:
+                return torch.from_numpy(np.array(data.features.tolist()).astype(float))
             return torch.from_numpy(data.features)
         elif isinstance(data, InputData) and isinstance(data.features, pd.DataFrame):
             return torch.from_numpy(data.features.values)
@@ -286,6 +286,8 @@ class NumpyConverter:
         self.numpy_data = self.convert_to_array(data)
         if self.numpy_data.ndim > 3:
             self.numpy_data = self.numpy_data.squeeze()
+        if self.numpy_data.dtype == object:
+            self.numpy_data = np.array(self.numpy_data.tolist(), dtype=float)
         self.numpy_data = np.where(
             np.isnan(self.numpy_data), 0, self.numpy_data)
         self.numpy_data = np.where(
@@ -530,7 +532,8 @@ class ConditionConverter:
             prediction = self.operation_example.predict(predict_data).reshape(-1, 1)
         elif output_mode == 'labels':
             prediction = self.operation_example.predict(predict_data)
-        elif n_classes == 1 and output_mode in ['default', 'probs']:
+        elif n_classes == 1 and output_mode in ['default', 'probs'] \
+                and hasattr(self.operation_example, 'score_samples'):
             prediction = self.operation_example.score_samples(predict_data)
         else:
             prediction = self.operation_example.predict_proba(predict_data)

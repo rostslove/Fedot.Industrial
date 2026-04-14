@@ -195,7 +195,7 @@ class FedotIndustrial(Fedot):
         predict = Either(value=predict_data,
                          monoid=[predict_data, custom_predict]).either(
             left_function=lambda predict_from_solver: predict_func(predict_from_solver),
-            right_function=lambda predict_from_custom: self.manager.solver.predict(predict_from_custom))
+            right_function=lambda predict_from_custom: self.manager.solver.predict(predict_from_custom, predict_mode))
         predict = Either.insert(predict).then(lambda x: _inverse_encoder_transform(x) if have_encoder else x). \
             then(lambda x: x.predict if isinstance(predict, OutputData) else x).value
         if predict_data.task.task_type.value.__contains__('forecasting'):
@@ -248,14 +248,16 @@ class FedotIndustrial(Fedot):
 
         """
 
-        def fit_function(train_data): 
+        def fit_function(train_data):
             # return \
             # Either(value=train_data, monoid=[train_data,
 
             #                                  not isinstance(self.manager.industrial_config.strategy, Callable)]). \
             # either(left_function=lambda data: self.manager.industrial_config.strategy.fit(data),
             #        right_function=lambda data: self.manager.solver.fit(data))
-            return self.manager.industrial_config.strategy.fit(train_data)
+            self.manager.industrial_config.strategy.fit(train_data)
+            self.manager.solver = self.manager.industrial_config.strategy
+            return self.manager.solver
         
         with exception_handler(Exception, on_exception=self.shutdown, suppress=False):
             Either.insert(self._process_input_data(input_data)). \

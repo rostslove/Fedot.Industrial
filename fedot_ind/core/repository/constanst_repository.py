@@ -118,6 +118,7 @@ class ComputationalConstant(Enum):
     FEDOT_WORKER_NUM = 5
     FEDOT_WORKER_TIMEOUT_PARTITION = 4
     PATIENCE_FOR_EARLY_STOP = 15
+    FEDOT_PARTITIONING_METHODS = ['sequential', 'kmeans', 'dbscan']
 
 
 class KernelsConstant(Enum):
@@ -1080,6 +1081,7 @@ BATCH_SIZE_FOR_FEDOT_WORKER = ComputationalConstant.BATCH_SIZE_FOR_FEDOT_WORKER.
 FEDOT_WORKER_NUM = ComputationalConstant.FEDOT_WORKER_NUM.value
 FEDOT_WORKER_TIMEOUT_PARTITION = ComputationalConstant.FEDOT_WORKER_TIMEOUT_PARTITION.value
 PATIENCE_FOR_EARLY_STOP = ComputationalConstant.PATIENCE_FOR_EARLY_STOP.value
+FEDOT_PARTITIONING_METHODS = ComputationalConstant.FEDOT_PARTITIONING_METHODS.value
 
 MULTI_ARRAY = DataTypeConstant.MULTI_ARRAY.value
 MATRIX = DataTypeConstant.MATRIX.value

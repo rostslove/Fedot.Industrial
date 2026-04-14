@@ -68,11 +68,24 @@ class LaggedAR(ModelImplementation):
         )
 
     def build_tuner(self, model_to_tune, tuning_params, train_data):
+        from copy import deepcopy
         tuning_data = self._define_tuning_data(train_data)
         search_space = self._define_search_space()
         pipeline_tuner = self._create_tuner(search_space, tuning_params, tuning_data)
-        model_to_tune = pipeline_tuner.tune(model_to_tune)
-        model_to_tune.fit(train_data)
+        safe_model = deepcopy(model_to_tune)
+        try:
+            model_to_tune = pipeline_tuner.tune(model_to_tune)
+        except Exception:
+            # Tuning can fail (e.g. AllTrialsFailed from hyperopt).
+            # Keep the un-tuned model.
+            model_to_tune = safe_model
+        try:
+            model_to_tune.fit(train_data)
+        except Exception:
+            # Tuned params may crash on fit (e.g. fourier_basis with
+            # bad low_rank on short data).  Fall back to un-tuned model.
+            safe_model.fit(train_data)
+            model_to_tune = safe_model
         del pipeline_tuner
         return model_to_tune
 

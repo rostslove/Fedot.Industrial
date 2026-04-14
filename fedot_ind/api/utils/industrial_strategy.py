@@ -96,7 +96,6 @@ class IndustrialStrategy:
             input_data, predict_mode)
 
     def _federated_strategy(self, input_data):
-        print('federated entry')
         n_samples = input_data.features.shape[0]
         if n_samples > BATCH_SIZE_FOR_FEDOT_WORKER:
             self.logger.info('RAF algorithm was applied')
@@ -218,27 +217,7 @@ class IndustrialStrategy:
     def _federated_predict(self,
                            input_data,
                            mode: str = 'labels'):
-        valid_nodes = self.solver.current_pipeline.root_node.nodes_from
-        self.predicted_branch_probs = [x.predict(input_data).predict for x in valid_nodes]
-
-        # reshape if binary
-        if len(self.predicted_branch_probs[0].shape) < 2:
-            self.predicted_branch_probs = [np.array([x, 1 - x]).T for x in self.predicted_branch_probs]
-
-        self.predicted_branch_labels = [np.argmax(x, axis=1) for x in self.predicted_branch_probs]
-
-        n_samples = self.predicted_branch_probs[0].shape[0]
-        n_channels = len(self.predicted_branch_probs)
-
-        head_model = deepcopy(self.solver.current_pipeline.root_node)
-        head_model.nodes_from = []
-        input_data.features = np.hstack(self.predicted_branch_labels).reshape(n_samples,
-                                                                              n_channels,
-                                                                              1)
-        if mode == 'labels':
-            return head_model.predict(input_data, 'labels').predict
-        else:
-            return head_model.predict(input_data).predict
+        return self.solver.predict(input_data, output_mode=mode)
 
     def _forecasting_predict(self,
                              input_data,

@@ -30,7 +30,8 @@ EXCLUDED_OPERATION_MUTATION = {
                    "nbeats_model",
                    'tcn_model',
                    'dummy',
-                   'deepar_model'
+                   'deepar_model',
+                   'cnn',
                    ],
     'anomaly_detection': ['inception_model',
                           'resnet_model',
@@ -93,6 +94,7 @@ EXCLUDED_OPERATION_MUTATION = {
         'recurrence_extractor',
         'bernb',
         'qda',
+        'cnn',
     ],
     'classification_tabular': [
         'resnet_model',

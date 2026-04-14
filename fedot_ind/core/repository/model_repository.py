@@ -81,7 +81,8 @@ class AtomizedModel(Enum):
         'class_decompose': DecomposerClassImplementation,
         # for imbalanced data
         'resample': ResampleImplementation,
-
+        # cnn placeholder (required by FEDOT for image data type)
+        'cnn': InceptionTimeModel,
     }
     SKLEARN_CLF_MODELS = {
         # boosting models (bid datasets)
