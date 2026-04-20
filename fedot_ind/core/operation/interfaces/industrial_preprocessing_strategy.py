@@ -84,6 +84,16 @@ class MultiDimPreprocessingStrategy(EvaluationStrategy):
             predict_data,
             output_mode: str = 'probs'):
 
+        # For genuinely tabular 2D data, ``output_mode_converter`` calls
+        # ``predict_proba`` → returns ``(N, 2)`` matrix, while FEDOT's
+        # metric evaluation expects labels ``(N,)``. That mismatch makes
+        # every tuning trial score exactly ~0.501 regardless of model.
+        # Force labels output for tabular classifiers.
+        _input = predict_data
+        if isinstance(_input, InputData) and getattr(_input, 'data_type', None) == DataTypesEnum.table \
+                and getattr(_input.features, 'ndim', 0) == 2:
+            output_mode = 'labels'
+
         one_class_operation = (self.operation_condition.is_one_class_operation,
                                self.operation_condition.is_regression_of_forecasting_task)
         only_predict_method = self.operation_condition.is_regression_of_forecasting_task \
@@ -116,6 +126,59 @@ class MultiDimPreprocessingStrategy(EvaluationStrategy):
             predict_data, trained_operation[0], self.mode)
         predict_method = self.operation_condition_for_channel_independent.have_predict_method
         fedot_input = self.operation_condition_for_channel_independent.is_transform_input_fedot
+
+        # Genuinely tabular 2D data was not split by channels during fit
+        # (see ``MultiDimPreprocessingStrategy.fit`` bypass). Match that
+        # here: run predict/transform once on the whole matrix. Two
+        # call conventions, matching the fit bail:
+        #   * FEDOT data-op wrapper: ``.transform(InputData) -> OutputData``.
+        #   * Raw sklearn estimator: ``.transform(X)`` (preprocessors) /
+        #     ``.predict_proba(X)`` (classifiers, so downstream metric
+        #     eval sees probabilities) / ``.predict(X)`` (regressors).
+        # Dispatch by fit signature (both kinds take a single arg to
+        # transform/predict, but only sklearn's ``fit`` takes ``(X, y)``),
+        # mirroring what the fit bail did.
+        if not isinstance(predict_data, list) \
+                and getattr(predict_data.features, 'ndim', 0) == 2 \
+                and predict_data.data_type == DataTypesEnum.table:
+            op = trained_operation[0]
+            sklearn_style = hasattr(op, 'fit') and len(signature(op.fit).parameters) > 1
+            if sklearn_style:
+                X = predict_data.features
+                # For sklearn preprocessors (scaling etc.) use ``transform``.
+                # For models (classifiers / regressors) use ``predict`` which
+                # returns labels / scalars shaped (N,) — matches what FEDOT's
+                # metric evaluation expects in default mode. Returning
+                # ``predict_proba`` here breaks downstream metric eval and
+                # makes every tuning trial score ~0.5 regardless of model.
+                if hasattr(op, 'transform') and not hasattr(op, 'predict'):
+                    prediction = op.transform(X)
+                elif hasattr(op, 'predict'):
+                    prediction = op.predict(X)
+                elif hasattr(op, 'transform'):
+                    prediction = op.transform(X)
+                else:
+                    raise ValueError(
+                        f"Operation {op!r} has neither .transform nor "
+                        ".predict for 2D tabular data")
+            else:
+                # FEDOT data-op wrapper path.
+                if hasattr(op, 'transform'):
+                    prediction = op.transform(predict_data)
+                elif hasattr(op, 'predict'):
+                    prediction = op.predict(predict_data)
+                else:
+                    raise ValueError(
+                        f"Operation {op!r} has neither .transform nor "
+                        ".predict for 2D tabular data")
+            if isinstance(prediction, OutputData):
+                return prediction.predict
+            arr = np.asarray(prediction)
+            # Classifier predict() returns (N,) labels; reshape to (N, 1)
+            # because downstream DataMerger / Industrial concat expects 2D.
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            return arr
 
         # create list of InputData, where each InputData correspond to each
         # channel
@@ -200,6 +263,54 @@ class MultiDimPreprocessingStrategy(EvaluationStrategy):
         self.operation_condition = Either(value=self.params_for_fit, monoid=[None, True]).then(
             lambda params: self._init_impl(params) if not list_of_params else list(map(self._init_impl, params))). \
             then(lambda operation: ConditionConverter(train_data, operation, self.mode)).value
+
+        # For 2D tabular + sklearn-style estimator (``.fit(X, y)``) the
+        # Industrial-managed ``_init_impl`` seeds the estimator with
+        # TS-oriented defaults (e.g. ``min_samples_leaf=0.5``) that collapse
+        # every tree to a constant predictor, pinning F1 at ~0.5 regardless
+        # of tuning. Rebuild the estimator with its class defaults before
+        # the fit chain runs — this affects both the ``one_dimensional``
+        # path (``fit_one_sample``) and the ``channel_independent`` path
+        # because they both pick up ``self.operation_condition.operation_implementation``.
+        is_single_tabular = (not isinstance(train_data, list)
+                             and getattr(train_data, 'data_type', None) == DataTypesEnum.table
+                             and getattr(train_data.features, 'ndim', 0) == 2)
+        if is_single_tabular and not isinstance(self.operation_condition.operation_implementation, list):
+            orig = self.operation_condition.operation_implementation
+            if hasattr(orig, 'fit') and len(signature(orig.fit).parameters) > 1:
+                try:
+                    fresh = type(orig)()
+                    self.operation_condition.operation_implementation = fresh
+                    self.operation_condition.operation_example = fresh
+                except Exception:
+                    pass
+
+        if is_single_tabular:
+            wrapper = self.operation_condition.operation_implementation
+            sklearn_style = len(signature(wrapper.fit).parameters) > 1
+            if sklearn_style:
+                # Industrial's default ``IndustrialOperationParameters`` and
+                # tuner search space for sklearn classifiers/regressors are
+                # TS-oriented: e.g. ``min_samples_leaf=0.5`` (float=fraction)
+                # which collapses every tree to a constant predictor on
+                # tabular data, so F1 stays ~0.5 regardless of tuning.
+                # For 2D-table we rebuild the estimator from its own class
+                # defaults; tuning over the Industrial space for tables is
+                # a separate fix (bad search ranges in Industrial repo).
+                impl_cls = type(wrapper)
+                try:
+                    wrapper = impl_cls()
+                except Exception:
+                    # Non-standard constructors (e.g. sklearn wrappers with
+                    # required args) — keep the pre-built wrapper.
+                    pass
+                target = train_data.target
+                if target is not None and target.ndim > 1 and target.shape[1] == 1:
+                    target = target.ravel()
+                wrapper.fit(train_data.features, target)
+            else:
+                wrapper.fit(train_data)
+            return wrapper
         operation_for_every_dim = self.operation_condition.input_data_is_list_container
         operation_for_one_dim = self.operation_condition.is_one_dim_operation
         operation_for_multidim = not any([operation_for_one_dim, operation_for_every_dim])

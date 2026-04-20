@@ -1,10 +1,21 @@
-"""Example: Federated AutoML with cluster-based dataset partitioning
-on the Adult Census Income dataset (ARFF format).
+"""Example: Federated AutoML with T2 (Uncertainty / Difficulty) partitioning
+on the Adult Census Income dataset.
 
-The partitioning method is controlled via ``strategy_params``:
+Strategy T2 fits a lightweight "easy" model via cross-validation, derives
+a per-sample difficulty score from its error / probability output, and
+splits the training set into ``n_splits`` contiguous difficulty buckets.
+Each RAF worker therefore specialises on a different difficulty band.
 
-* ``'partitioning_method'``:  ``'sequential'`` | ``'kmeans'`` | ``'dbscan'``
-* ``'partitioning_params'``:  extra kwargs forwarded to the partitioner.
+Tunable ``partitioning_params`` for ``'difficulty'``:
+
+* ``cv``: number of CV folds for the weak model (default 3).
+* ``order``: ``'hard_first'`` (default) puts the hardest samples in the
+  first partition (which RAF uses as ``main_target``), ``'easy_first'``
+  does the opposite.
+* ``task_type``: ``'classification'`` / ``'regression'`` (auto-inferred).
+* ``scale_features``: z-score features before the weak model
+  (default True).
+* ``random_state``: seed for the weak model and any resampling.
 """
 import numpy as np
 import pandas as pd
@@ -21,12 +32,7 @@ DATASET_PATH = r'examples\automl_example\custom_strategy\big_data\data\adult.csv
 
 
 def _load_adult(path: str, test_size: float = 0.3, random_state: int = 42):
-    """Load and preprocess the Adult Census Income dataset from CSV.
-
-    Returns ``(train_data, test_data)`` tuples of ``(X, y)``.
-    """
     df = pd.read_csv(path)
-
     df = df.replace('?', np.nan).dropna()
 
     target_col = 'income'
@@ -38,25 +44,18 @@ def _load_adult(path: str, test_size: float = 0.3, random_state: int = 42):
 
     cat_cols = ['workclass', 'education', 'marital.status', 'occupation',
                 'relationship', 'race', 'sex', 'native.country']
-    num_cols = [c for c in X.columns if c not in cat_cols]
-
     X = pd.get_dummies(X, columns=cat_cols, drop_first=True).astype(np.float32)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size,
         random_state=random_state, stratify=y)
-
     return (X_train, y_train), (X_test, y_test)
 
 
-def run_clustered_federated_example(timeout: int = 10,
-                                    partitioning_method: str = 'kmeans'):
-    """Run federated AutoML with a configurable partitioning strategy.
-
-    Args:
-        timeout: total AutoML budget in minutes.
-        partitioning_method: one of ``'sequential'``, ``'kmeans'``, ``'dbscan'``.
-    """
+def run_difficulty_federated_example(timeout: int = 10,
+                                     order: str = 'hard_first',
+                                     cv: int = 3):
+    """Run federated AutoML with the T2 difficulty partitioner."""
     industrial_config = {
         'problem': 'classification',
         'learning_strategy': 'federated_automl',
@@ -65,12 +64,12 @@ def run_clustered_federated_example(timeout: int = 10,
             'timeout': timeout,
             'data_type': 'table',
             'problem': 'classification',
-            # Industrial monkey-patches PipelineObjectiveEvaluate.evaluate in
-            # the main process; loky worker processes don't inherit the patch
-            # and blow up on unpickle. Keep composer single-process.
             'n_jobs': 1,
-            'partitioning_method': partitioning_method,
+            'partitioning_method': 'difficulty',
             'partitioning_params': {
+                'task_type': 'classification',
+                'cv': cv,
+                'order': order,
                 'random_state': 42,
                 'scale_features': True,
             },
@@ -79,7 +78,8 @@ def run_clustered_federated_example(timeout: int = 10,
 
     learning_config = {
         'learning_strategy': 'from_scratch',
-        'learning_strategy_params': {**DEFAULT_AUTOML_LEARNING_CONFIG, 'timeout': timeout, 'n_jobs': 1},
+        'learning_strategy_params': {**DEFAULT_AUTOML_LEARNING_CONFIG,
+                                     'timeout': timeout, 'n_jobs': 1},
         'optimisation_loss': {'quality_loss': 'f1'},
     }
 
@@ -91,8 +91,8 @@ def run_clustered_federated_example(timeout: int = 10,
     }
 
     train_data, test_data = _load_adult(DATASET_PATH, test_size=0.3)
-
     dataset_dict = dict(train_data=train_data, test_data=test_data)
+
     result_dict = ApiTemplate(
         api_config=api_config,
         metric_list=('f1', 'accuracy'),
@@ -102,5 +102,6 @@ def run_clustered_federated_example(timeout: int = 10,
 
 
 if __name__ == '__main__':
-    result = run_clustered_federated_example(timeout=20, partitioning_method='dbscan')
+    result = run_difficulty_federated_example(
+        timeout=20, order='hard_first', cv=3)
     print(result)

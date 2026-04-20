@@ -189,6 +189,8 @@ class FedotConverter:
                 supplementary_data=self.input_data.supplementary_data)
         elif mode == 'channel_independent':
             feats = self.input_data.features
+            if feats.ndim == 2 and self.input_data.data_type == DataTypesEnum.table:
+                return self.input_data
             with_one_sample = self.data_type_condition.have_one_sample
             with_one_channel = self.data_type_condition.have_one_channel
             with_one_element = self.data_type_condition.have_one_element

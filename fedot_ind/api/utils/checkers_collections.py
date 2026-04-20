@@ -4,6 +4,7 @@ from typing import Union
 
 import pandas as pd
 from fedot.core.data.data import InputData
+from fedot.core.repository.dataset_types import DataTypesEnum
 from fedot.core.repository.tasks import Task, TsForecastingParams, TaskTypesEnum
 from pymonad.either import Either
 from sklearn.preprocessing import LabelEncoder
@@ -176,11 +177,14 @@ class DataCheck:
         - Converts features to torch format using NumpyConverter.
 
         """
+        keep_2d = self.task != 'ts_forecasting' and self.data_type == DataTypesEnum.table
+        needs_torch_format = self.task != 'ts_forecasting' and not keep_2d
+
         self.input_data.features = Either.insert(self.input_data.features). \
             then(lambda data: np.where(np.isnan(data), 0, data)). \
             then(lambda data_without_nan: np.where(np.isinf(data_without_nan), 0, data_without_nan)). \
             then(lambda data_without_inf: NumpyConverter(data=data_without_inf).convert_to_torch_format()
-                 if self.task != 'ts_forecasting' else data_without_inf).value
+                 if needs_torch_format else data_without_inf).value
 
     def _check_input_data_target(self):
         """Checks and preprocesses the features in the input data.

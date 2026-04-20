@@ -1,10 +1,19 @@
-"""Example: Federated AutoML with cluster-based dataset partitioning
-on the Adult Census Income dataset (ARFF format).
+"""Example: Federated AutoML with T3 (Stratified Sampling) partitioning
+on the Adult Census Income dataset.
 
-The partitioning method is controlled via ``strategy_params``:
+Strategy T3 splits the training set with
+:class:`sklearn.model_selection.StratifiedKFold` (classification) or its
+quantile-binned equivalent (regression).  Every partition therefore
+preserves the original target distribution -- the natural baseline for
+imbalanced datasets such as Adult Income (~24% positives).
 
-* ``'partitioning_method'``:  ``'sequential'`` | ``'kmeans'`` | ``'dbscan'``
-* ``'partitioning_params'``:  extra kwargs forwarded to the partitioner.
+Tunable ``partitioning_params`` for ``'stratified'``:
+
+* ``task_type``: ``'classification'`` / ``'regression'`` (auto-inferred).
+* ``regression_bins``: number of quantile bins used to stratify
+  regression targets (default 10). Ignored for classification.
+* ``shuffle``: whether to shuffle before splitting (default True).
+* ``random_state``: seed used when ``shuffle`` is True.
 """
 import numpy as np
 import pandas as pd
@@ -21,12 +30,7 @@ DATASET_PATH = r'examples\automl_example\custom_strategy\big_data\data\adult.csv
 
 
 def _load_adult(path: str, test_size: float = 0.3, random_state: int = 42):
-    """Load and preprocess the Adult Census Income dataset from CSV.
-
-    Returns ``(train_data, test_data)`` tuples of ``(X, y)``.
-    """
     df = pd.read_csv(path)
-
     df = df.replace('?', np.nan).dropna()
 
     target_col = 'income'
@@ -38,25 +42,17 @@ def _load_adult(path: str, test_size: float = 0.3, random_state: int = 42):
 
     cat_cols = ['workclass', 'education', 'marital.status', 'occupation',
                 'relationship', 'race', 'sex', 'native.country']
-    num_cols = [c for c in X.columns if c not in cat_cols]
-
     X = pd.get_dummies(X, columns=cat_cols, drop_first=True).astype(np.float32)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size,
         random_state=random_state, stratify=y)
-
     return (X_train, y_train), (X_test, y_test)
 
 
-def run_clustered_federated_example(timeout: int = 10,
-                                    partitioning_method: str = 'kmeans'):
-    """Run federated AutoML with a configurable partitioning strategy.
-
-    Args:
-        timeout: total AutoML budget in minutes.
-        partitioning_method: one of ``'sequential'``, ``'kmeans'``, ``'dbscan'``.
-    """
+def run_stratified_federated_example(timeout: int = 10,
+                                     shuffle: bool = True):
+    """Run federated AutoML with the T3 stratified partitioner."""
     industrial_config = {
         'problem': 'classification',
         'learning_strategy': 'federated_automl',
@@ -65,21 +61,20 @@ def run_clustered_federated_example(timeout: int = 10,
             'timeout': timeout,
             'data_type': 'table',
             'problem': 'classification',
-            # Industrial monkey-patches PipelineObjectiveEvaluate.evaluate in
-            # the main process; loky worker processes don't inherit the patch
-            # and blow up on unpickle. Keep composer single-process.
             'n_jobs': 1,
-            'partitioning_method': partitioning_method,
+            'partitioning_method': 'stratified',
             'partitioning_params': {
+                'task_type': 'classification',
+                'shuffle': shuffle,
                 'random_state': 42,
-                'scale_features': True,
             },
         },
     }
 
     learning_config = {
         'learning_strategy': 'from_scratch',
-        'learning_strategy_params': {**DEFAULT_AUTOML_LEARNING_CONFIG, 'timeout': timeout, 'n_jobs': 1},
+        'learning_strategy_params': {**DEFAULT_AUTOML_LEARNING_CONFIG,
+                                     'timeout': timeout, 'n_jobs': 1},
         'optimisation_loss': {'quality_loss': 'f1'},
     }
 
@@ -91,8 +86,8 @@ def run_clustered_federated_example(timeout: int = 10,
     }
 
     train_data, test_data = _load_adult(DATASET_PATH, test_size=0.3)
-
     dataset_dict = dict(train_data=train_data, test_data=test_data)
+
     result_dict = ApiTemplate(
         api_config=api_config,
         metric_list=('f1', 'accuracy'),
@@ -102,5 +97,5 @@ def run_clustered_federated_example(timeout: int = 10,
 
 
 if __name__ == '__main__':
-    result = run_clustered_federated_example(timeout=20, partitioning_method='dbscan')
+    result = run_stratified_federated_example(timeout=20, shuffle=True)
     print(result)

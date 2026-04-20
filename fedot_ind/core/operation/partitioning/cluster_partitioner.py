@@ -4,7 +4,10 @@ from abc import abstractmethod
 from typing import Dict, List, Optional, Tuple
 
 from sklearn.cluster import DBSCAN, KMeans
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
 from fedot_ind.core.architecture.settings.computational import backend_methods as np
 
@@ -464,6 +467,287 @@ class DBSCANPartitioner(BasePartitioner):
         return features_list, target_list
 
 
+class DifficultyPartitioner(BasePartitioner):
+    """Partition data by sample difficulty estimated from a weak model (T2).
+
+    A lightweight "easy" model (shallow decision tree by default) is fit
+    via cross-validation on the full training set; per-sample *difficulty*
+    scores are derived from the resulting confusion/error signal:
+
+    * classification: ``difficulty = 1 - p(y_true)`` using
+      ``cross_val_predict(method='predict_proba')`` -- higher when the
+      weak model is uncertain about the true label.  Falls back to
+      ``1[y_pred != y_true]`` when probabilities are unavailable.
+    * regression: absolute residual ``|y_true - y_pred|``, standardised
+      by the target's interquartile range so the scale matches the
+      classification case.
+
+    Samples are then sorted by difficulty and split into ``n_splits``
+    contiguous buckets. Each RAF worker therefore specialises on a
+    different difficulty band (easiest -> hardest), which mirrors the
+    T2 "uncertainty/difficulty sampling" design.
+
+    Args:
+        n_splits: number of difficulty buckets.
+        task_type: ``'classification'`` or ``'regression'``. If ``None``
+            the type is inferred from ``target`` at partition time.
+        weak_model: optional pre-configured estimator implementing
+            ``fit`` / ``predict`` (and ``predict_proba`` for
+            classification). Defaults to a shallow
+            ``DecisionTreeClassifier`` / ``DecisionTreeRegressor``.
+        cv: number of CV folds for ``cross_val_predict``.
+        random_state: seed for reproducibility.
+        scale_features: whether to z-score features before fitting the
+            weak model.
+        order: ``'hard_first'`` places the hardest samples in the first
+            partition (default -- the first partition is used as
+            ``main_target`` by :class:`RAFEnsembler`, so giving it the
+            most informative / hardest examples tends to help the head).
+            ``'easy_first'`` does the opposite.
+    """
+
+    def __init__(self,
+                 n_splits: int = 5,
+                 task_type: Optional[str] = None,
+                 weak_model=None,
+                 cv: int = 3,
+                 random_state: int = 42,
+                 scale_features: bool = True,
+                 order: str = 'hard_first'):
+        super().__init__(n_splits)
+        if order not in ('hard_first', 'easy_first'):
+            raise ValueError(
+                f"order must be 'hard_first' or 'easy_first', got {order!r}")
+        self.task_type = task_type
+        self.weak_model = weak_model
+        self.cv = cv
+        self.random_state = random_state
+        self.scale_features = scale_features
+        self.order = order
+        self.scaler: Optional[StandardScaler] = None
+        self.difficulty_: Optional[np.ndarray] = None
+
+    def partition(self,
+                  features: np.ndarray,
+                  target: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        flat_features = self._flatten_features(features)
+        x = self._scale(flat_features)
+        y = np.asarray(target).ravel()
+
+        task_type = self._resolve_task_type(y)
+        difficulty = self._compute_difficulty(x, y, task_type)
+        self.difficulty_ = difficulty
+
+        n_samples = len(y)
+        effective_n_splits = min(self.n_splits, n_samples)
+        if effective_n_splits < self.n_splits:
+            self.logger.warning(
+                f'n_splits={self.n_splits} exceeds n_samples={n_samples}. '
+                f'Reduced to {effective_n_splits}')
+
+        order = np.argsort(difficulty)
+        if self.order == 'hard_first':
+            # sort descending so the first bucket = hardest samples
+            order = order[::-1]
+
+        feature_buckets = np.array_split(order, effective_n_splits)
+        features_splits = [features[idx] for idx in feature_buckets]
+        target_splits = [target[idx] for idx in feature_buckets]
+
+        self.logger.info(
+            f'DifficultyPartitioner: difficulty mean={difficulty.mean():.4f}, '
+            f'std={difficulty.std():.4f}, '
+            f'min={difficulty.min():.4f}, max={difficulty.max():.4f}')
+        return self._finalize(features_splits, target_splits)
+
+    def _scale(self, flat_features: np.ndarray) -> np.ndarray:
+        if not self.scale_features:
+            return flat_features
+        self.scaler = StandardScaler()
+        return self.scaler.fit_transform(flat_features)
+
+    def _resolve_task_type(self, y: np.ndarray) -> str:
+        if self.task_type is not None:
+            return self.task_type
+        # heuristic: integer dtype with few unique values -> classification
+        unique = np.unique(y)
+        if np.issubdtype(y.dtype, np.integer) or unique.size <= max(20, int(0.05 * len(y))):
+            return 'classification'
+        return 'regression'
+
+    def _default_weak_model(self, task_type: str):
+        if task_type == 'classification':
+            return DecisionTreeClassifier(
+                max_depth=5, random_state=self.random_state)
+        return DecisionTreeRegressor(
+            max_depth=5, random_state=self.random_state)
+
+    def _compute_difficulty(self,
+                            x: np.ndarray,
+                            y: np.ndarray,
+                            task_type: str) -> np.ndarray:
+        model = self.weak_model if self.weak_model is not None \
+            else self._default_weak_model(task_type)
+
+        effective_cv = min(self.cv, len(y))
+        if task_type == 'classification':
+            unique, counts = np.unique(y, return_counts=True)
+            # cross_val_predict with StratifiedKFold needs min(count) >= cv
+            effective_cv = max(2, min(effective_cv, int(counts.min())))
+
+        if effective_cv < 2:
+            # fallback: fit on the whole set; error signal is still informative
+            model.fit(x, y)
+            if task_type == 'classification' and hasattr(model, 'predict_proba'):
+                proba = model.predict_proba(x)
+                return self._proba_to_difficulty(proba, y, model.classes_)
+            y_pred = model.predict(x)
+            if task_type == 'classification':
+                return (y_pred != y).astype(float)
+            return self._regression_residual(y, y_pred)
+
+        try:
+            if task_type == 'classification' and hasattr(model, 'predict_proba'):
+                proba = cross_val_predict(
+                    model, x, y, cv=effective_cv, method='predict_proba')
+                classes = np.unique(y)
+                return self._proba_to_difficulty(proba, y, classes)
+            y_pred = cross_val_predict(model, x, y, cv=effective_cv)
+            if task_type == 'classification':
+                return (y_pred != y).astype(float)
+            return self._regression_residual(y, y_pred)
+        except Exception as err:  # noqa: BLE001
+            self.logger.warning(
+                f'cross_val_predict failed ({err!r}); fitting weak model on the full set')
+            model.fit(x, y)
+            y_pred = model.predict(x)
+            if task_type == 'classification':
+                if hasattr(model, 'predict_proba'):
+                    return self._proba_to_difficulty(
+                        model.predict_proba(x), y, model.classes_)
+                return (y_pred != y).astype(float)
+            return self._regression_residual(y, y_pred)
+
+    @staticmethod
+    def _proba_to_difficulty(proba: np.ndarray,
+                             y: np.ndarray,
+                             classes: np.ndarray) -> np.ndarray:
+        """Difficulty = 1 - p(true_class); larger means more uncertain."""
+        class_to_col = {c: i for i, c in enumerate(classes)}
+        cols = np.array([class_to_col.get(int(v), -1) for v in y.astype(int)])
+        rows = np.arange(len(y))
+        true_proba = np.zeros(len(y), dtype=float)
+        valid = cols >= 0
+        true_proba[valid] = proba[rows[valid], cols[valid]]
+        return 1.0 - true_proba
+
+    @staticmethod
+    def _regression_residual(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+        resid = np.abs(y_true.astype(float) - y_pred.astype(float))
+        q75, q25 = np.percentile(y_true, [75, 25])
+        iqr = max(float(q75 - q25), 1e-9)
+        return resid / iqr
+
+
+class StratifiedPartitioner(BasePartitioner):
+    """Partition data with stratified sampling to preserve target distribution (T3).
+
+    For classification, :class:`sklearn.model_selection.StratifiedKFold`
+    is used -- every partition keeps the original class proportions
+    (within the usual integer-rounding slack).  For regression, the
+    target is discretised into ``regression_bins`` quantile bins and the
+    same stratified split is applied to those bins, so each partition
+    covers the full target range.
+
+    This is the cheapest partitioner that still respects the class
+    balance invariant enforced by :meth:`BasePartitioner._finalize`,
+    and it is the natural baseline for the cluster-based strategies.
+
+    Args:
+        n_splits: number of partitions (== number of stratified folds).
+        task_type: ``'classification'`` or ``'regression'`` (auto-inferred
+            if ``None``).
+        regression_bins: number of quantile bins used for regression
+            stratification. Ignored for classification.
+        random_state: seed for reproducibility.
+        shuffle: whether to shuffle before splitting.
+    """
+
+    def __init__(self,
+                 n_splits: int = 5,
+                 task_type: Optional[str] = None,
+                 regression_bins: int = 10,
+                 random_state: int = 42,
+                 shuffle: bool = True):
+        super().__init__(n_splits)
+        self.task_type = task_type
+        self.regression_bins = regression_bins
+        self.random_state = random_state
+        self.shuffle = shuffle
+
+    def partition(self,
+                  features: np.ndarray,
+                  target: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        y = np.asarray(target).ravel()
+        n_samples = len(y)
+
+        effective_n_splits = min(self.n_splits, n_samples)
+        if effective_n_splits < 2:
+            # a single split == the whole dataset; defer to the finaliser
+            return self._finalize([features], [target])
+        if effective_n_splits < self.n_splits:
+            self.logger.warning(
+                f'n_splits={self.n_splits} exceeds n_samples={n_samples}. '
+                f'Reduced to {effective_n_splits}')
+
+        task_type = self._resolve_task_type(y)
+        strata = self._build_strata(y, task_type)
+        effective_n_splits = self._clamp_to_min_class_size(
+            strata, effective_n_splits)
+
+        try:
+            skf = StratifiedKFold(
+                n_splits=effective_n_splits,
+                shuffle=self.shuffle,
+                random_state=self.random_state if self.shuffle else None)
+            bucket_indices = [test_idx for _, test_idx in skf.split(
+                np.zeros(n_samples), strata)]
+        except ValueError as err:
+            self.logger.warning(
+                f'StratifiedKFold failed ({err!r}); falling back to shuffled '
+                f'sequential splits')
+            rng = np.random.default_rng(self.random_state)
+            order = rng.permutation(n_samples) if self.shuffle else np.arange(n_samples)
+            bucket_indices = np.array_split(order, effective_n_splits)
+
+        features_splits = [features[idx] for idx in bucket_indices]
+        target_splits = [target[idx] for idx in bucket_indices]
+        return self._finalize(features_splits, target_splits)
+
+    def _resolve_task_type(self, y: np.ndarray) -> str:
+        if self.task_type is not None:
+            return self.task_type
+        unique = np.unique(y)
+        if np.issubdtype(y.dtype, np.integer) or unique.size <= max(20, int(0.05 * len(y))):
+            return 'classification'
+        return 'regression'
+
+    def _build_strata(self, y: np.ndarray, task_type: str) -> np.ndarray:
+        if task_type == 'classification':
+            return y
+        n_bins = max(2, min(self.regression_bins, len(np.unique(y))))
+        quantiles = np.linspace(0.0, 1.0, n_bins + 1)[1:-1]
+        edges = np.quantile(y, quantiles)
+        # np.digitize returns integers in [0, n_bins]
+        return np.digitize(y, edges)
+
+    @staticmethod
+    def _clamp_to_min_class_size(strata: np.ndarray, n_splits: int) -> int:
+        _, counts = np.unique(strata, return_counts=True)
+        min_count = int(counts.min()) if counts.size else 1
+        return max(2, min(n_splits, min_count))
+
+
 class FeatureSpacePartitioner:
     """Factory that instantiates a partitioner by name.
 
@@ -472,12 +756,18 @@ class FeatureSpacePartitioner:
     * ``'sequential'`` -- equal-sized sequential chunks (default).
     * ``'kmeans'`` -- K-Means clustering in feature space.
     * ``'dbscan'`` -- DBSCAN density-based clustering.
+    * ``'difficulty'`` -- T2: bucket samples by a weak model's per-sample
+      error / uncertainty.
+    * ``'stratified'`` -- T3: stratified splits preserving target
+      distribution.
     """
 
     PARTITIONER_REGISTRY = {
         'sequential': SequentialPartitioner,
         'kmeans': KMeansPartitioner,
         'dbscan': DBSCANPartitioner,
+        'difficulty': DifficultyPartitioner,
+        'stratified': StratifiedPartitioner,
     }
 
     @classmethod
@@ -485,15 +775,16 @@ class FeatureSpacePartitioner:
                method: str = 'sequential',
                n_splits: int = 5,
                params: Optional[dict] = None) -> BasePartitioner:
-        params = params or {}
+        params = dict(params or {})
         method = method.lower()
         if method not in cls.PARTITIONER_REGISTRY:
             raise ValueError(
                 f"Unknown partitioning method '{method}'. "
                 f"Available: {list(cls.PARTITIONER_REGISTRY.keys())}")
         partitioner_cls = cls.PARTITIONER_REGISTRY[method]
+        effective_n_splits = params.pop('n_splits', n_splits)
         # keep only kwargs accepted by the concrete partitioner so that a
         # shared ``partitioning_params`` dict can be reused across methods
         accepted = set(inspect.signature(partitioner_cls.__init__).parameters)
         kwargs = {k: v for k, v in params.items() if k in accepted}
-        return partitioner_cls(n_splits=n_splits, **kwargs)
+        return partitioner_cls(n_splits=effective_n_splits, **kwargs)

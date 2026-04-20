@@ -307,7 +307,15 @@ def merge_industrial_targets(self) -> np.array:
 
 
 def merge_industrial_predicts(*args) -> np.array:
-    predicts = args[1]
+    merger_self = args[0] if len(args) >= 2 else None
+    predicts = args[1] if len(args) >= 2 else args[0]
+    data_type = getattr(merger_self, 'data_type', None)
+
+    if data_type == DataTypesEnum.table:
+        from fedot.core.data.array_utilities import atleast_2d
+        predicts_2d = [atleast_2d(p) for p in predicts]
+        return np.concatenate(predicts_2d, axis=-1)
+
     predicts = [NumpyConverter(
         data=prediction).convert_to_torch_format() for prediction in predicts]
     sample_shape, channel_shape, elem_shape = [

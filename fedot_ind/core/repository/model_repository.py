@@ -266,7 +266,7 @@ def default_industrial_availiable_operation(problem: str = 'regression'):
                       'classification': INDUSTRIAL_CLF_AUTOML_MODEL.keys(),
                       'anomaly_detection': ANOMALY_DETECTION_MODELS.keys(),
                       'classification_tabular': SKLEARN_CLF_MODELS.keys(),
-                      'regression_tabular': SKLEARN_CLF_MODELS.keys()}
+                      'regression_tabular': SKLEARN_REG_MODELS.keys()}
     available_operations = {'ts_forecasting': [operation_dict[problem],
                                                FORECASTING_PREPROC.keys(),
                                                # SKLEARN_REG_MODELS.keys(),

@@ -3,6 +3,8 @@ from fedot_ind.core.operation.partitioning.cluster_partitioner import (
     SequentialPartitioner,
     KMeansPartitioner,
     DBSCANPartitioner,
+    DifficultyPartitioner,
+    StratifiedPartitioner,
     FeatureSpacePartitioner
 )
 
@@ -11,5 +13,7 @@ __all__ = [
     'SequentialPartitioner',
     'KMeansPartitioner',
     'DBSCANPartitioner',
+    'DifficultyPartitioner',
+    'StratifiedPartitioner',
     'FeatureSpacePartitioner'
 ]
