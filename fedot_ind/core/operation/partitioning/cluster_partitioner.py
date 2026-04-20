@@ -4,7 +4,6 @@ from abc import abstractmethod
 from typing import Dict, List, Optional, Tuple
 
 from sklearn.cluster import DBSCAN, KMeans
-from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
@@ -40,6 +39,24 @@ class BasePartitioner:
         if features.ndim > 2:
             return features.reshape(features.shape[0], -1)
         return features
+
+    @staticmethod
+    def _infer_task_type(target: np.ndarray,
+                         explicit: Optional[str] = None) -> str:
+        """Return ``'classification'`` or ``'regression'``.
+
+        If ``explicit`` is provided it wins; otherwise a simple heuristic
+        on ``target`` decides: integer dtype or "few distinct values"
+        relative to the sample count ⇒ classification.
+        """
+        if explicit is not None:
+            return explicit
+        y = np.asarray(target).ravel()
+        unique = np.unique(y)
+        if np.issubdtype(y.dtype, np.integer) or \
+                unique.size <= max(20, int(0.05 * len(y))):
+            return 'classification'
+        return 'regression'
 
     #: target fraction of the minority class after donation.  Set to
     #: 0.5 so that the first (most-balanced) partition reaches a true
@@ -472,20 +489,20 @@ class DifficultyPartitioner(BasePartitioner):
 
     A lightweight "easy" model (shallow decision tree by default) is fit
     via cross-validation on the full training set; per-sample *difficulty*
-    scores are derived from the resulting confusion/error signal:
+    scores are derived from the resulting error signal:
 
     * classification: ``difficulty = 1 - p(y_true)`` using
       ``cross_val_predict(method='predict_proba')`` -- higher when the
-      weak model is uncertain about the true label.  Falls back to
-      ``1[y_pred != y_true]`` when probabilities are unavailable.
-    * regression: absolute residual ``|y_true - y_pred|``, standardised
-      by the target's interquartile range so the scale matches the
-      classification case.
+      weak model is uncertain about the true label. Falls back to
+      ``1[y_pred != y_true]`` when the model has no ``predict_proba``.
+    * regression: absolute residual ``|y_true - y_pred|``.
 
     Samples are then sorted by difficulty and split into ``n_splits``
-    contiguous buckets. Each RAF worker therefore specialises on a
-    different difficulty band (easiest -> hardest), which mirrors the
-    T2 "uncertainty/difficulty sampling" design.
+    contiguous buckets.  Each RAF worker therefore specialises on a
+    different difficulty band.  The ordering of the resulting partitions
+    is finalised by :meth:`BasePartitioner._finalize`, which promotes the
+    most class-balanced partition to index 0 (required by
+    :class:`RAFEnsembler`'s ``main_target`` contract).
 
     Args:
         n_splits: number of difficulty buckets.
@@ -494,16 +511,11 @@ class DifficultyPartitioner(BasePartitioner):
         weak_model: optional pre-configured estimator implementing
             ``fit`` / ``predict`` (and ``predict_proba`` for
             classification). Defaults to a shallow
-            ``DecisionTreeClassifier`` / ``DecisionTreeRegressor``.
+            ``DecisionTreeClassifier`` / ``DecisionTreeRegressor`` --
+            both tree-based models are scale-invariant, so no feature
+            scaling is applied by this partitioner.
         cv: number of CV folds for ``cross_val_predict``.
-        random_state: seed for reproducibility.
-        scale_features: whether to z-score features before fitting the
-            weak model.
-        order: ``'hard_first'`` places the hardest samples in the first
-            partition (default -- the first partition is used as
-            ``main_target`` by :class:`RAFEnsembler`, so giving it the
-            most informative / hardest examples tends to help the head).
-            ``'easy_first'`` does the opposite.
+        random_state: seed for reproducibility of the default weak model.
     """
 
     def __init__(self,
@@ -511,32 +523,21 @@ class DifficultyPartitioner(BasePartitioner):
                  task_type: Optional[str] = None,
                  weak_model=None,
                  cv: int = 3,
-                 random_state: int = 42,
-                 scale_features: bool = True,
-                 order: str = 'hard_first'):
+                 random_state: int = 42):
         super().__init__(n_splits)
-        if order not in ('hard_first', 'easy_first'):
-            raise ValueError(
-                f"order must be 'hard_first' or 'easy_first', got {order!r}")
         self.task_type = task_type
         self.weak_model = weak_model
         self.cv = cv
         self.random_state = random_state
-        self.scale_features = scale_features
-        self.order = order
-        self.scaler: Optional[StandardScaler] = None
-        self.difficulty_: Optional[np.ndarray] = None
 
     def partition(self,
                   features: np.ndarray,
                   target: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        flat_features = self._flatten_features(features)
-        x = self._scale(flat_features)
+        x = self._flatten_features(features)
         y = np.asarray(target).ravel()
 
-        task_type = self._resolve_task_type(y)
+        task_type = self._infer_task_type(y, self.task_type)
         difficulty = self._compute_difficulty(x, y, task_type)
-        self.difficulty_ = difficulty
 
         n_samples = len(y)
         effective_n_splits = min(self.n_splits, n_samples)
@@ -546,10 +547,6 @@ class DifficultyPartitioner(BasePartitioner):
                 f'Reduced to {effective_n_splits}')
 
         order = np.argsort(difficulty)
-        if self.order == 'hard_first':
-            # sort descending so the first bucket = hardest samples
-            order = order[::-1]
-
         feature_buckets = np.array_split(order, effective_n_splits)
         features_splits = [features[idx] for idx in feature_buckets]
         target_splits = [target[idx] for idx in feature_buckets]
@@ -559,21 +556,6 @@ class DifficultyPartitioner(BasePartitioner):
             f'std={difficulty.std():.4f}, '
             f'min={difficulty.min():.4f}, max={difficulty.max():.4f}')
         return self._finalize(features_splits, target_splits)
-
-    def _scale(self, flat_features: np.ndarray) -> np.ndarray:
-        if not self.scale_features:
-            return flat_features
-        self.scaler = StandardScaler()
-        return self.scaler.fit_transform(flat_features)
-
-    def _resolve_task_type(self, y: np.ndarray) -> str:
-        if self.task_type is not None:
-            return self.task_type
-        # heuristic: integer dtype with few unique values -> classification
-        unique = np.unique(y)
-        if np.issubdtype(y.dtype, np.integer) or unique.size <= max(20, int(0.05 * len(y))):
-            return 'classification'
-        return 'regression'
 
     def _default_weak_model(self, task_type: str):
         if task_type == 'classification':
@@ -586,67 +568,72 @@ class DifficultyPartitioner(BasePartitioner):
                             x: np.ndarray,
                             y: np.ndarray,
                             task_type: str) -> np.ndarray:
+        """Return a 1-D difficulty score per sample.
+
+        The CV path and the "fit on the full set" fallback share the same
+        post-processing: we always end up with either (``proba``,
+        ``classes``) for classification with ``predict_proba``, or
+        ``y_pred`` otherwise. That pair then maps to a difficulty score
+        the same way in both branches.
+        """
         model = self.weak_model if self.weak_model is not None \
             else self._default_weak_model(task_type)
+        has_proba = task_type == 'classification' and hasattr(model, 'predict_proba')
+        effective_cv = self._effective_cv(y, task_type)
 
-        effective_cv = min(self.cv, len(y))
-        if task_type == 'classification':
-            unique, counts = np.unique(y, return_counts=True)
-            # cross_val_predict with StratifiedKFold needs min(count) >= cv
-            effective_cv = max(2, min(effective_cv, int(counts.min())))
-
-        if effective_cv < 2:
-            # fallback: fit on the whole set; error signal is still informative
-            model.fit(x, y)
-            if task_type == 'classification' and hasattr(model, 'predict_proba'):
-                proba = model.predict_proba(x)
-                return self._proba_to_difficulty(proba, y, model.classes_)
-            y_pred = model.predict(x)
-            if task_type == 'classification':
-                return (y_pred != y).astype(float)
-            return self._regression_residual(y, y_pred)
-
+        proba = y_pred = classes = None
         try:
-            if task_type == 'classification' and hasattr(model, 'predict_proba'):
+            if effective_cv < 2:
+                raise ValueError(f'effective_cv={effective_cv} is too small for CV')
+            if has_proba:
                 proba = cross_val_predict(
                     model, x, y, cv=effective_cv, method='predict_proba')
                 classes = np.unique(y)
-                return self._proba_to_difficulty(proba, y, classes)
-            y_pred = cross_val_predict(model, x, y, cv=effective_cv)
-            if task_type == 'classification':
-                return (y_pred != y).astype(float)
-            return self._regression_residual(y, y_pred)
+            else:
+                y_pred = cross_val_predict(model, x, y, cv=effective_cv)
         except Exception as err:  # noqa: BLE001
             self.logger.warning(
-                f'cross_val_predict failed ({err!r}); fitting weak model on the full set')
+                f'cross_val_predict unavailable ({err!r}); '
+                f'fitting weak model on the full set')
             model.fit(x, y)
-            y_pred = model.predict(x)
-            if task_type == 'classification':
-                if hasattr(model, 'predict_proba'):
-                    return self._proba_to_difficulty(
-                        model.predict_proba(x), y, model.classes_)
-                return (y_pred != y).astype(float)
-            return self._regression_residual(y, y_pred)
+            if has_proba:
+                proba = model.predict_proba(x)
+                classes = model.classes_
+            else:
+                y_pred = model.predict(x)
+
+        if has_proba:
+            return self._proba_to_difficulty(proba, y, classes)
+        if task_type == 'classification':
+            return (y_pred != y).astype(float)
+        return np.abs(y.astype(float) - y_pred.astype(float))
+
+    def _effective_cv(self, y: np.ndarray, task_type: str) -> int:
+        """CV fold count actually usable for this dataset.
+
+        For classification ``StratifiedKFold`` requires every class to
+        have at least ``cv`` samples; for regression only the sample
+        count matters.
+        """
+        effective_cv = min(self.cv, len(y))
+        if task_type == 'classification':
+            _, counts = np.unique(y, return_counts=True)
+            effective_cv = min(effective_cv, int(counts.min()))
+        return effective_cv
 
     @staticmethod
     def _proba_to_difficulty(proba: np.ndarray,
                              y: np.ndarray,
                              classes: np.ndarray) -> np.ndarray:
-        """Difficulty = 1 - p(true_class); larger means more uncertain."""
-        class_to_col = {c: i for i, c in enumerate(classes)}
-        cols = np.array([class_to_col.get(int(v), -1) for v in y.astype(int)])
-        rows = np.arange(len(y))
-        true_proba = np.zeros(len(y), dtype=float)
-        valid = cols >= 0
-        true_proba[valid] = proba[rows[valid], cols[valid]]
-        return 1.0 - true_proba
+        """Difficulty = 1 - p(true_class); larger means more uncertain.
 
-    @staticmethod
-    def _regression_residual(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-        resid = np.abs(y_true.astype(float) - y_pred.astype(float))
-        q75, q25 = np.percentile(y_true, [75, 25])
-        iqr = max(float(q75 - q25), 1e-9)
-        return resid / iqr
+        ``classes`` is assumed to be sorted (it comes from ``np.unique``
+        or sklearn's ``classes_``), so ``searchsorted`` maps each label
+        to its column in ``proba`` in one vectorised call.
+        """
+        cols = np.searchsorted(classes, y)
+        true_proba = proba[np.arange(len(y)), cols]
+        return 1.0 - true_proba
 
 
 class StratifiedPartitioner(BasePartitioner):
@@ -700,7 +687,7 @@ class StratifiedPartitioner(BasePartitioner):
                 f'n_splits={self.n_splits} exceeds n_samples={n_samples}. '
                 f'Reduced to {effective_n_splits}')
 
-        task_type = self._resolve_task_type(y)
+        task_type = self._infer_task_type(y, self.task_type)
         strata = self._build_strata(y, task_type)
         effective_n_splits = self._clamp_to_min_class_size(
             strata, effective_n_splits)
@@ -723,14 +710,6 @@ class StratifiedPartitioner(BasePartitioner):
         features_splits = [features[idx] for idx in bucket_indices]
         target_splits = [target[idx] for idx in bucket_indices]
         return self._finalize(features_splits, target_splits)
-
-    def _resolve_task_type(self, y: np.ndarray) -> str:
-        if self.task_type is not None:
-            return self.task_type
-        unique = np.unique(y)
-        if np.issubdtype(y.dtype, np.integer) or unique.size <= max(20, int(0.05 * len(y))):
-            return 'classification'
-        return 'regression'
 
     def _build_strata(self, y: np.ndarray, task_type: str) -> np.ndarray:
         if task_type == 'classification':
