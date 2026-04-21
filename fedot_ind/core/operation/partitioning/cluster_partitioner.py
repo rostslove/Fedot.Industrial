@@ -67,6 +67,12 @@ class BasePartitioner:
     _MINORITY_TARGET_RATIO = 0.5
     #: absolute floor on donation size, independent of partition size.
     _MIN_DONATION = 10
+    #: whether :meth:`_finalize` should shuffle samples within each
+    #: partition. Classification partitioners keep the default (``True``)
+    #: so that class-sorted inputs don't produce single-class prefixes
+    #: after ``DataMerger`` truncation; time-series partitioners set this
+    #: to ``False`` to preserve temporal order inside each partition.
+    _shuffle_within_partitions = True
 
     def _finalize(self,
                   features_splits: List[np.ndarray],
@@ -79,29 +85,48 @@ class BasePartitioner:
         ``DataMerger``. If the first partition is class-skewed, the head
         model silently collapses to a constant predictor.
 
-        Every partition is shuffled in-place as well because
+        Every partition is shuffled in-place as well (unless
+        ``_shuffle_within_partitions`` is ``False``) because
         ``DataMerger`` truncates every branch's output to the
         ``min(partition_length)`` prefix — an unshuffled class-sorted
         prefix would still be single-class even when the whole partition
         contains both classes.
+
+        For continuous (regression / TS forecasting) targets the
+        class-diversity donation and the balance-based reordering are
+        both skipped: every unique float value would otherwise be
+        treated as its own "class", turning the donation loop into a
+        no-op that still scans every sample.
         """
         features_splits, target_splits = zip(*[
             (f, t) for f, t in zip(features_splits, target_splits) if len(f) > 0
         ]) if any(len(f) > 0 for f in features_splits) else ([], [])
         features_splits, target_splits = list(features_splits), list(target_splits)
 
-        features_splits, target_splits = self._ensure_class_diversity(
-            features_splits, target_splits)
+        is_classification = self._targets_are_classification(target_splits)
+        if is_classification:
+            features_splits, target_splits = self._ensure_class_diversity(
+                features_splits, target_splits)
 
-        rng = np.random.default_rng(1)
-        for idx in range(len(features_splits)):
-            order = rng.permutation(len(features_splits[idx]))
-            features_splits[idx] = features_splits[idx][order]
-            target_splits[idx] = target_splits[idx][order]
+        if self._shuffle_within_partitions:
+            rng = np.random.default_rng(1)
+            for idx in range(len(features_splits)):
+                order = rng.permutation(len(features_splits[idx]))
+                features_splits[idx] = features_splits[idx][order]
+                target_splits[idx] = target_splits[idx][order]
 
-        features_splits, target_splits = self._reorder_by_balance(
-            features_splits, target_splits)
+        if is_classification:
+            features_splits, target_splits = self._reorder_by_balance(
+                features_splits, target_splits)
         return features_splits, target_splits
+
+    @classmethod
+    def _targets_are_classification(cls, target_splits: List[np.ndarray]) -> bool:
+        """Cheap check: concatenate all targets and ask :meth:`_infer_task_type`."""
+        if not target_splits:
+            return False
+        concatenated = np.concatenate([t.ravel() for t in target_splits])
+        return cls._infer_task_type(concatenated) == 'classification'
 
     @staticmethod
     def _reorder_by_balance(features_splits: List[np.ndarray],
@@ -732,13 +757,24 @@ class FeatureSpacePartitioner:
 
     Supported methods:
 
-    * ``'sequential'`` -- equal-sized sequential chunks (default).
-    * ``'kmeans'`` -- K-Means clustering in feature space.
-    * ``'dbscan'`` -- DBSCAN density-based clustering.
-    * ``'difficulty'`` -- T2: bucket samples by a weak model's per-sample
-      error / uncertainty.
-    * ``'stratified'`` -- T3: stratified splits preserving target
-      distribution.
+    * Tabular:
+
+      * ``'sequential'`` -- equal-sized sequential chunks (default).
+      * ``'kmeans'`` -- K-Means clustering in feature space.
+      * ``'dbscan'`` -- DBSCAN density-based clustering.
+      * ``'difficulty'`` -- T2: bucket samples by a weak model's
+        per-sample error / uncertainty.
+      * ``'stratified'`` -- T3: stratified splits preserving target
+        distribution.
+
+    * Time series (registered lazily from
+      :mod:`.ts_partitioner` to avoid circular imports):
+
+      * ``'temporal'`` -- TS1: contiguous blocks along the time axis.
+      * ``'ts_feature_clustering'`` -- TS2: cluster series by
+        hand-crafted statistical / spectral descriptors.
+      * ``'ts_difficulty'`` -- TS3: bucket samples by residuals from a
+        teacher model fit on the whole set (no CV, TS-safe).
     """
 
     PARTITIONER_REGISTRY = {

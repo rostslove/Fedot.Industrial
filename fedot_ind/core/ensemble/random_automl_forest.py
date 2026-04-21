@@ -53,6 +53,11 @@ class RAFEnsembler:
       weak model's error matrix.
     * ``'stratified'`` -- stratified splits preserving the target
       distribution.
+    * ``'temporal'`` -- TS1: contiguous blocks along the time axis.
+    * ``'ts_feature_clustering'`` -- TS2: cluster series by their
+      statistical / spectral descriptors.
+    * ``'ts_difficulty'`` -- TS3: bucket samples by residuals from a
+      teacher model fit on the whole training set (no CV).
 
     Additional clustering parameters can be passed via
     ``composing_params['partitioning_params']`` dict.
