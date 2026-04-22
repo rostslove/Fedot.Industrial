@@ -50,9 +50,17 @@ class TemporalSplitPartitioner(BasePartitioner):
             forecaster.
         min_chunk_size: minimum samples per chunk. If ``n_splits`` would
             produce chunks smaller than this, ``n_splits`` is reduced.
-    """
 
-    _shuffle_within_partitions = False
+    Note on ordering: the partitioner assigns samples to partitions
+    contiguously along the time axis, but :meth:`_finalize` still
+    reshuffles rows *inside* each partition. This is mandatory for
+    RAF's ``DataMerger`` contract -- it truncates every branch to the
+    ``min(partition_length)`` prefix, so an unshuffled contiguous
+    prefix would feed the head model a set of rows with no cross-
+    branch alignment and collapse it into a constant predictor. For
+    multi-series TS classification (the supported use case) the row
+    order within a partition has no temporal meaning anyway.
+    """
 
     def __init__(self,
                  n_splits: int = 5,
@@ -299,9 +307,14 @@ class TSModelDifficultyPartitioner(BasePartitioner):
         random_state: seed for the default teacher.
         scale_features: z-score features before fitting the teacher.
             Helpful for Ridge; harmless for trees.
-    """
 
-    _shuffle_within_partitions = False
+    Note on ordering: after sorting by difficulty and splitting into
+    buckets, :meth:`_finalize` still shuffles rows *inside* each
+    partition. This is mandatory for RAF's ``DataMerger`` contract
+    (see :class:`TemporalSplitPartitioner` for the explanation).
+    Within a difficulty band the relative order of samples is
+    irrelevant, so shuffling does not degrade the signal.
+    """
 
     def __init__(self,
                  n_splits: int = 5,

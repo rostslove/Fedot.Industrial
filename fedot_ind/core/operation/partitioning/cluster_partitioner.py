@@ -67,12 +67,6 @@ class BasePartitioner:
     _MINORITY_TARGET_RATIO = 0.5
     #: absolute floor on donation size, independent of partition size.
     _MIN_DONATION = 10
-    #: whether :meth:`_finalize` should shuffle samples within each
-    #: partition. Classification partitioners keep the default (``True``)
-    #: so that class-sorted inputs don't produce single-class prefixes
-    #: after ``DataMerger`` truncation; time-series partitioners set this
-    #: to ``False`` to preserve temporal order inside each partition.
-    _shuffle_within_partitions = True
 
     def _finalize(self,
                   features_splits: List[np.ndarray],
@@ -85,12 +79,16 @@ class BasePartitioner:
         ``DataMerger``. If the first partition is class-skewed, the head
         model silently collapses to a constant predictor.
 
-        Every partition is shuffled in-place as well (unless
-        ``_shuffle_within_partitions`` is ``False``) because
+        Every partition is ALWAYS shuffled in-place because
         ``DataMerger`` truncates every branch's output to the
-        ``min(partition_length)`` prefix — an unshuffled class-sorted
-        prefix would still be single-class even when the whole partition
-        contains both classes.
+        ``min(partition_length)`` prefix — an unshuffled prefix would
+        feed the head model a set of rows with no cross-branch
+        alignment (each branch's prefix is its own contiguous block of
+        samples, not a matching slice) and collapse the head into a
+        constant predictor.  This invariant is required by every
+        partitioner subclass; TS partitioners that group by time,
+        cluster, or difficulty still keep the *partition assignment*
+        intact, only the row order inside a partition is randomised.
 
         For continuous (regression / TS forecasting) targets the
         class-diversity donation and the balance-based reordering are
@@ -108,12 +106,11 @@ class BasePartitioner:
             features_splits, target_splits = self._ensure_class_diversity(
                 features_splits, target_splits)
 
-        if self._shuffle_within_partitions:
-            rng = np.random.default_rng(1)
-            for idx in range(len(features_splits)):
-                order = rng.permutation(len(features_splits[idx]))
-                features_splits[idx] = features_splits[idx][order]
-                target_splits[idx] = target_splits[idx][order]
+        rng = np.random.default_rng(1)
+        for idx in range(len(features_splits)):
+            order = rng.permutation(len(features_splits[idx]))
+            features_splits[idx] = features_splits[idx][order]
+            target_splits[idx] = target_splits[idx][order]
 
         if is_classification:
             features_splits, target_splits = self._reorder_by_balance(

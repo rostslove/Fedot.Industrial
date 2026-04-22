@@ -1,14 +1,17 @@
 """Example: Federated AutoML with TS3 (Model-Based Difficulty) partitioning.
 
-Mirrors :mod:`federated_automl_example` (synthetic multi-series TS,
-binary classification, ``data_type='time_series'``). TS3 fits a
-lightweight teacher on the full training set -- a shallow
-``DecisionTreeClassifier`` for classification or ``Ridge`` for
-regression -- then sorts samples by the teacher's error and splits
-them into ``n_splits`` contiguous difficulty bands. Unlike
-:class:`DifficultyPartitioner` this variant does NOT use
-cross-validation: standard K-Fold reshuffles time and is invalid for
-a TS curriculum.
+Synthetic multi-series TS from :class:`TimeSeriesDatasetsGenerator`,
+binary classification. TS3 fits a lightweight teacher on the full
+training set -- a shallow ``DecisionTreeClassifier`` for
+classification or ``Ridge`` for regression -- then sorts samples by
+the teacher's error and splits them into ``n_splits`` contiguous
+difficulty bands. Unlike :class:`DifficultyPartitioner` this variant
+does NOT use cross-validation: standard K-Fold reshuffles time and
+is invalid for a TS curriculum.
+
+``data_type='time_series'`` is intentional: the head's collapse issue
+was fixed inside :class:`RAFEnsembler` (row-aligned stacking), so the
+heavy Industrial TS pool in the branches now works as designed.
 
 Tunable ``partitioning_params`` for ``'ts_difficulty'``:
 
@@ -39,6 +42,7 @@ def run_ts_difficulty_federated_ts_example(timeout: int = 10,
             'timeout': timeout,
             'data_type': 'time_series',
             'problem': 'classification',
+            'n_jobs': 1,
             'partitioning_method': 'ts_difficulty',
             'partitioning_params': {
                 'task_type': 'classification',
@@ -80,5 +84,7 @@ def run_ts_difficulty_federated_ts_example(timeout: int = 10,
 
 
 if __name__ == '__main__':
-    result = run_ts_difficulty_federated_ts_example(timeout=2)
+    # timeout=2 min is too small -- see note in
+    # temporal_split_federated_ts_example.py.
+    result = run_ts_difficulty_federated_ts_example(timeout=10)
     print(result)

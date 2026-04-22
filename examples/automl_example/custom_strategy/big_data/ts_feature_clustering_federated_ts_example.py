@@ -1,13 +1,15 @@
 """Example: Federated AutoML with TS2 (Feature-Based Clustering) partitioning.
 
-Mirrors :mod:`federated_automl_example` (synthetic multi-series TS,
-binary classification, ``data_type='time_series'``). TS2 treats each
-row of ``features`` as one time series and extracts a compact
-descriptor vector (mean / std / linear trend / lag-1 autocorrelation /
-dominant FFT amplitude / Shannon entropy). KMeans then groups series
-with similar patterns (trend / seasonality / volatility) into the
-same partition, so every RAF worker specialises on a distinct
-"regime".
+Synthetic multi-series TS from :class:`TimeSeriesDatasetsGenerator`,
+binary classification. TS2 treats each row of ``features`` as one
+time series and extracts a compact descriptor vector (mean / std /
+linear trend / lag-1 autocorrelation / dominant FFT amplitude /
+Shannon entropy). KMeans then groups series with similar patterns
+(trend / seasonality / volatility) into the same partition.
+
+``data_type='time_series'`` is intentional: the head's collapse issue
+was fixed inside :class:`RAFEnsembler` (row-aligned stacking), so the
+heavy Industrial TS pool in the branches now works as designed.
 
 Tunable ``partitioning_params`` for ``'ts_feature_clustering'``:
 
@@ -40,6 +42,7 @@ def run_ts_feature_clustering_federated_ts_example(
             'timeout': timeout,
             'data_type': 'time_series',
             'problem': 'classification',
+            'n_jobs': 1,
             'partitioning_method': 'ts_feature_clustering',
             'partitioning_params': {
                 'features_to_use': features_to_use,
@@ -81,5 +84,7 @@ def run_ts_feature_clustering_federated_ts_example(
 
 
 if __name__ == '__main__':
-    result = run_ts_feature_clustering_federated_ts_example(timeout=2)
+    # timeout=2 min is too small -- see note in
+    # temporal_split_federated_ts_example.py.
+    result = run_ts_feature_clustering_federated_ts_example(timeout=10)
     print(result)

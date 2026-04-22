@@ -1,4 +1,5 @@
 from copy import deepcopy
+from typing import List
 
 from fedot.core.data.data import InputData
 from fedot.core.data.multi_modal import MultiModalData
@@ -9,7 +10,7 @@ from fedot.core.repository.dataset_types import DataTypesEnum
 from fedot_ind.core.architecture.settings.computational import backend_methods as np
 from fedot_ind.core.operation.partitioning import FeatureSpacePartitioner
 from fedot_ind.core.repository.constanst_repository import FEDOT_ATOMIZE_OPERATION, FEDOT_HEAD_ENSEMBLE, FEDOT_TASK
-from fedot_ind.core.repository.model_repository import SKLEARN_CLF_MODELS, SKLEARN_REG_MODELS, default_industrial_availiable_operation
+from fedot_ind.core.repository.model_repository import default_industrial_availiable_operation
 
 
 _DATA_TYPE_TO_ENUM = {
@@ -69,12 +70,13 @@ class RAFEnsembler:
                  batch_size: int = 1000):
 
         self.current_pipeline = None
+        self._branches: List[Pipeline] = []
+        self._head: Pipeline = None
         self.problem = composing_params['problem']
         self.task = FEDOT_TASK[composing_params['problem']]
         self.atomized_automl = FEDOT_ATOMIZE_OPERATION[composing_params['problem']]
         self.head = FEDOT_HEAD_ENSEMBLE[composing_params['problem']]
 
-        self.ensemble_method = self._raf_ensemble
         self.atomized_automl_params = deepcopy(composing_params)
 
         raw_data_type = self.atomized_automl_params.pop('data_type', 'image')
@@ -116,57 +118,127 @@ class RAFEnsembler:
             n_splits=self.n_splits,
             params=self.partitioning_params)
 
-        new_features, new_target = partitioner.partition(
+        features_splits, target_splits = partitioner.partition(
             train_data.features, train_data.target)
+        self.n_splits = len(features_splits)
 
-        self.n_splits = len(new_features)
+        # 1. fit one atomized-AutoML per partition (heavy TS models live here).
+        self._branches = self._fit_branches(features_splits, target_splits)
 
-        self.current_pipeline = self.ensemble_method(new_features,
-                                                     new_target,
-                                                     n_splits=self.n_splits)
+        # 2. every branch predicts on the FULL training set -> row-aligned
+        #    stacked feature matrix. This is the key difference vs. the
+        #    previous MultiModalData + ``join_branches`` design: there each
+        #    branch saw a DIFFERENT partition during fit, so after
+        #    ``DataMerger`` truncated to ``min(partition_length)`` the row k
+        #    of the head's training matrix contained predictions from four
+        #    branches on four UNRELATED samples. Only column 0 correlated
+        #    with the target (branch 0 was trained on partition 0 and on its
+        #    own partition's rows predicted perfectly), and the head
+        #    silently degenerated to "copy branch 0" -- which at inference
+        #    collapsed to whatever branch 0's pipeline emitted (often a
+        #    single-class constant when the branch itself under-fit).
+        #
+        #    Here, the same set of rows feeds every branch at both fit and
+        #    predict time, so the head sees a properly-aligned feature
+        #    matrix and can learn a real combination.
+        stacked_train = self._stack_predictions(self._branches, train_data)
+
+        # 3. fit the head on (stacked_train, full_target).
+        self._head = self._fit_head(stacked_train, train_data.target)
+
+        # ``current_pipeline`` is kept for downstream code / serialisers that
+        # expect a single FEDOT Pipeline to inspect; we expose the head since
+        # it owns the final decision boundary.
+        self.current_pipeline = self._head
 
     def predict(self, test_data, output_mode: str = 'labels'):
-        test_multimodal = self._to_multimodal(test_data)
-        return self.current_pipeline.predict(test_multimodal, output_mode).predict
+        stacked_test = self._stack_predictions(self._branches, test_data)
+        head_input = InputData(
+            idx=np.arange(stacked_test.shape[0]),
+            features=stacked_test,
+            target=(np.asarray(test_data.target)
+                    if getattr(test_data, 'target', None) is not None else None),
+            task=self.task,
+            data_type=DataTypesEnum.table)
+        return self._head.predict(head_input, output_mode).predict
 
-    def _to_multimodal(self, input_data):
-        """Convert InputData to MultiModalData matching the training format."""
-        data_dict = {}
-        for i in range(self.n_splits):
-            fold_data = InputData(idx=input_data.idx,
-                                  features=input_data.features,
-                                  target=input_data.target,
-                                  task=self.task,
-                                  data_type=self.data_type)
-            data_dict[f'{self.source_prefix}/{i}'] = fold_data
-        return MultiModalData(data_dict)
+    def _fit_branches(self,
+                      features_splits: List[np.ndarray],
+                      target_splits: List[np.ndarray]) -> List[Pipeline]:
+        """Build and fit one ``data_source/i -> atomized_automl`` pipeline
+        per partition.  Each branch is an independent FEDOT composing run
+        on its own slice of the training data; the TS-specific operations
+        pool (InceptionTime, industrial_*_clf, quantile_extractor, ...) is
+        fully available inside each branch — that is the point of RAF.
 
-    def _raf_ensemble(self, features, target, n_splits):
-        raf_ensemble = PipelineBuilder()
-        data_dict = {}
-        for i, data_fold_features, data_fold_target in zip(range(n_splits), features, target):
+        The source node is kept because Industrial's atomized operations
+        (``fedot_cls`` / ``fedot_regr``) are registered with FEDOT's
+        repository only when routed through a ``data_source_*`` node via
+        ``MultiModalData``.
+        """
+        branches: List[Pipeline] = []
+        for idx, (features, target) in enumerate(zip(features_splits, target_splits)):
+            source_name = f'{self.source_prefix}/{idx}'
+            fold = InputData(
+                idx=np.arange(len(features)),
+                features=np.asarray(features),
+                target=np.asarray(target),
+                task=self.task,
+                data_type=self.data_type)
+            branch = (PipelineBuilder()
+                      .add_node(operation_type=source_name, branch_idx=0)
+                      .add_node(self.atomized_automl,
+                                params=deepcopy(self.atomized_automl_params),
+                                branch_idx=0)
+                      .build())
+            branch.fit(input_data=MultiModalData({source_name: fold}))
+            branches.append(branch)
+        return branches
 
-            train_fold = InputData(idx=np.arange(0, len(data_fold_features)),
-                                   features=data_fold_features,
-                                   target=data_fold_target,
-                                   task=self.task,
-                                   data_type=self.data_type)
+    def _stack_predictions(self,
+                           branches: List[Pipeline],
+                           input_data: InputData) -> np.ndarray:
+        """Run every branch on the same ``input_data`` and column-concatenate
+        their outputs.  For classification we pull probabilities (one column
+        per class per branch) so the head sees a continuous feature space;
+        for regression the default scalar output is used.
+        """
+        branch_mode = 'full_probs' if self.problem == 'classification' else 'labels'
+        target = (np.asarray(input_data.target)
+                  if getattr(input_data, 'target', None) is not None else None)
+        features = np.asarray(input_data.features)
+        idx_arr = np.asarray(input_data.idx)
 
-            raf_ensemble.add_node(operation_type=f'{self.source_prefix}/{i}',
-                                  branch_idx=i)\
-                .add_node(self.atomized_automl,
-                          params=self.atomized_automl_params,
-                          branch_idx=i)
+        columns: List[np.ndarray] = []
+        for idx, branch in enumerate(branches):
+            source_name = f'{self.source_prefix}/{idx}'
+            fold = InputData(
+                idx=idx_arr, features=features, target=target,
+                task=self.task, data_type=self.data_type)
+            mmd = MultiModalData({source_name: fold})
+            try:
+                raw = branch.predict(mmd, output_mode=branch_mode).predict
+            except (TypeError, ValueError):
+                raw = branch.predict(mmd).predict
+            raw = np.asarray(raw)
+            if raw.ndim == 1:
+                raw = raw.reshape(-1, 1)
+            columns.append(raw)
+        return np.concatenate(columns, axis=1).astype(np.float32, copy=False)
 
-            data_dict.update({f'{self.source_prefix}/{i}': train_fold})
-        train_multimodal = MultiModalData(data_dict)
-        head_automl_params = deepcopy(self.atomized_automl_params)
+    def _fit_head(self, stacked: np.ndarray, target: np.ndarray) -> Pipeline:
+        """Fit the meta-learner on the row-aligned stacked features.
 
-        head_automl_params['available_operations'] = [
-            operation for operation in head_automl_params['available_operations'] if operation in list(
-                SKLEARN_CLF_MODELS.keys()) or operation in list(
-                SKLEARN_REG_MODELS.keys())]
-
-        raf_ensemble = raf_ensemble.join_branches(self.head).build()
-        raf_ensemble.fit(input_data=train_multimodal)
-        return raf_ensemble
+        The head always operates on a plain ``(n_samples, n_stacked_features)``
+        tabular matrix, regardless of the original ``data_type`` of the
+        branches, so we pin its InputData to ``DataTypesEnum.table``.
+        """
+        head_input = InputData(
+            idx=np.arange(stacked.shape[0]),
+            features=stacked,
+            target=np.asarray(target),
+            task=self.task,
+            data_type=DataTypesEnum.table)
+        head = PipelineBuilder().add_node(self.head).build()
+        head.fit(input_data=head_input)
+        return head
