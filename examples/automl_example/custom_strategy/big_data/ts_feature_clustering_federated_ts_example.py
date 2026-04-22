@@ -1,11 +1,14 @@
-"""Example: Federated AutoML with TS2 (Feature-Based Clustering) partitioning.
+"""Example: Federated AutoML with TS2 (Feature-Based Clustering) on M4.
 
-Synthetic multi-series TS from :class:`TimeSeriesDatasetsGenerator`,
-binary classification. TS2 treats each row of ``features`` as one
-time series and extracts a compact descriptor vector (mean / std /
-linear trend / lag-1 autocorrelation / dominant FFT amplitude /
+M4 is reshaped into a multi-class TS-classification task
+(label = frequency group: Daily / Weekly / Monthly / Quarterly / Yearly)
+by :func:`load_m4_classification`. TS2 treats each row of ``features``
+as one time series and extracts a compact descriptor vector (mean / std
+/ linear trend / lag-1 autocorrelation / dominant FFT amplitude /
 Shannon entropy). KMeans then groups series with similar patterns
-(trend / seasonality / volatility) into the same partition.
+(trend / seasonality / volatility) into the same partition -- which is
+particularly expressive on M4 because different frequency groups show
+distinctly different descriptor profiles.
 
 ``data_type='time_series'`` is intentional: the head's collapse issue
 was fixed inside :class:`RAFEnsembler` (row-aligned stacking), so the
@@ -25,13 +28,17 @@ from fedot_ind.core.repository.config_repository import (
     DEFAULT_CLF_AUTOML_CONFIG,
     DEFAULT_COMPUTE_CONFIG,
 )
-from fedot_ind.tools.synthetic.ts_datasets_generator import TimeSeriesDatasetsGenerator
+
+try:
+    from examples.automl_example.custom_strategy.big_data.m4_classification_utils import load_m4_classification
+except ModuleNotFoundError:
+    from m4_classification_utils import load_m4_classification
 
 
 def run_ts_feature_clustering_federated_ts_example(
         timeout: int = 10,
-        num_samples: int = 1800,
-        max_ts_len: int = 50,
+        n_per_group: int = 400,
+        window_length: int = 50,
         features_to_use=('mean', 'std', 'trend',
                          'lag1_ac', 'dom_fft', 'entropy')):
     industrial_config = {
@@ -65,14 +72,12 @@ def run_ts_feature_clustering_federated_ts_example(
         'compute_config': DEFAULT_COMPUTE_CONFIG,
     }
 
-    train_data, test_data = TimeSeriesDatasetsGenerator(
-        num_samples=num_samples,
-        task='classification',
-        max_ts_len=max_ts_len,
-        binary=True,
-        test_size=0.5,
-        multivariate=False,
-    ).generate_data()
+    train_data, test_data = load_m4_classification(
+        n_per_group=n_per_group,
+        window_length=window_length,
+        test_size=0.3,
+        random_state=42,
+    )
 
     dataset_dict = dict(train_data=train_data, test_data=test_data)
     result_dict = ApiTemplate(

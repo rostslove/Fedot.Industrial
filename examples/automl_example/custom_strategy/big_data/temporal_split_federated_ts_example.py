@@ -1,18 +1,18 @@
-"""Example: Federated AutoML with TS1 (Temporal Split) partitioning.
+"""Example: Federated AutoML with TS1 (Temporal Split) partitioning on M4.
 
-Synthetic multi-series TS from :class:`TimeSeriesDatasetsGenerator`,
-binary classification with ``data_type='time_series'`` so that each
-RAF worker is free to choose from the heavy Industrial TS pool
-(InceptionTime, quantile_extractor, minirocket_extractor, ...).
+M4 is reshaped into a multi-class TS-classification task
+(label = frequency group: Daily / Weekly / Monthly / Quarterly / Yearly)
+by :func:`load_m4_classification`. Every row is one M4 series truncated
+to ``window_length`` points. ``data_type='time_series'`` keeps the heavy
+Industrial TS pool (InceptionTime, quantile_extractor,
+minirocket_extractor, ...) available inside each RAF branch.
 
 The stacking asymmetry that used to collapse the head is fixed in
-:class:`RAFEnsembler` itself: branches now predict on the FULL
-training set to build a row-aligned stacked feature matrix for the
-head, instead of the old ``MultiModalData`` + ``join_branches`` path
-where the head trained on four branches' predictions on four DIFFERENT
-partitions (so only column 0 correlated with the target and the head
-degenerated to "copy branch 0"). See the fit-time docstring of
-:meth:`RAFEnsembler.fit` for details.
+:class:`RAFEnsembler` itself: branches now predict on the FULL training
+set to build a row-aligned stacked feature matrix for the head, instead
+of the old ``MultiModalData`` + ``join_branches`` path where the head
+trained on four branches' predictions on four DIFFERENT partitions.
+See the fit-time docstring of :meth:`RAFEnsembler.fit` for details.
 
 Tunable ``partitioning_params`` for ``'temporal'``:
 
@@ -27,12 +27,16 @@ from fedot_ind.core.repository.config_repository import (
     DEFAULT_CLF_AUTOML_CONFIG,
     DEFAULT_COMPUTE_CONFIG,
 )
-from fedot_ind.tools.synthetic.ts_datasets_generator import TimeSeriesDatasetsGenerator
+
+try:
+    from examples.automl_example.custom_strategy.big_data.m4_classification_utils import load_m4_classification
+except ModuleNotFoundError:
+    from m4_classification_utils import load_m4_classification
 
 
 def run_temporal_split_federated_ts_example(timeout: int = 10,
-                                            num_samples: int = 1800,
-                                            max_ts_len: int = 50,
+                                            n_per_group: int = 400,
+                                            window_length: int = 50,
                                             overlap: float = 0.0):
     industrial_config = {
         'problem': 'classification',
@@ -64,14 +68,12 @@ def run_temporal_split_federated_ts_example(timeout: int = 10,
         'compute_config': DEFAULT_COMPUTE_CONFIG,
     }
 
-    train_data, test_data = TimeSeriesDatasetsGenerator(
-        num_samples=num_samples,
-        task='classification',
-        max_ts_len=max_ts_len,
-        binary=True,
-        test_size=0.5,
-        multivariate=False,
-    ).generate_data()
+    train_data, test_data = load_m4_classification(
+        n_per_group=n_per_group,
+        window_length=window_length,
+        test_size=0.3,
+        random_state=42,
+    )
 
     dataset_dict = dict(train_data=train_data, test_data=test_data)
     result_dict = ApiTemplate(

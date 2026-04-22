@@ -1,13 +1,14 @@
-"""Example: Federated AutoML with TS3 (Model-Based Difficulty) partitioning.
+"""Example: Federated AutoML with TS3 (Model-Based Difficulty) on M4.
 
-Synthetic multi-series TS from :class:`TimeSeriesDatasetsGenerator`,
-binary classification. TS3 fits a lightweight teacher on the full
-training set -- a shallow ``DecisionTreeClassifier`` for
+M4 is reshaped into a multi-class TS-classification task
+(label = frequency group: Daily / Weekly / Monthly / Quarterly / Yearly)
+by :func:`load_m4_classification`. TS3 fits a lightweight teacher on
+the full training set -- a shallow ``DecisionTreeClassifier`` for
 classification or ``Ridge`` for regression -- then sorts samples by
 the teacher's error and splits them into ``n_splits`` contiguous
 difficulty bands. Unlike :class:`DifficultyPartitioner` this variant
-does NOT use cross-validation: standard K-Fold reshuffles time and
-is invalid for a TS curriculum.
+does NOT use cross-validation: standard K-Fold reshuffles time and is
+invalid for a TS curriculum.
 
 ``data_type='time_series'`` is intentional: the head's collapse issue
 was fixed inside :class:`RAFEnsembler` (row-aligned stacking), so the
@@ -28,12 +29,16 @@ from fedot_ind.core.repository.config_repository import (
     DEFAULT_CLF_AUTOML_CONFIG,
     DEFAULT_COMPUTE_CONFIG,
 )
-from fedot_ind.tools.synthetic.ts_datasets_generator import TimeSeriesDatasetsGenerator
+
+try:
+    from examples.automl_example.custom_strategy.big_data.m4_classification_utils import load_m4_classification
+except ModuleNotFoundError:
+    from m4_classification_utils import load_m4_classification
 
 
 def run_ts_difficulty_federated_ts_example(timeout: int = 10,
-                                           num_samples: int = 1800,
-                                           max_ts_len: int = 50):
+                                           n_per_group: int = 400,
+                                           window_length: int = 50):
     industrial_config = {
         'problem': 'classification',
         'learning_strategy': 'federated_automl',
@@ -65,14 +70,12 @@ def run_ts_difficulty_federated_ts_example(timeout: int = 10,
         'compute_config': DEFAULT_COMPUTE_CONFIG,
     }
 
-    train_data, test_data = TimeSeriesDatasetsGenerator(
-        num_samples=num_samples,
-        task='classification',
-        max_ts_len=max_ts_len,
-        binary=True,
-        test_size=0.5,
-        multivariate=False,
-    ).generate_data()
+    train_data, test_data = load_m4_classification(
+        n_per_group=n_per_group,
+        window_length=window_length,
+        test_size=0.3,
+        random_state=42,
+    )
 
     dataset_dict = dict(train_data=train_data, test_data=test_data)
     result_dict = ApiTemplate(
