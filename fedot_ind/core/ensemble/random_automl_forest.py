@@ -205,7 +205,8 @@ class RAFEnsembler:
 
     def _collect_branch_predictions(self,
                                      branches: List[Pipeline],
-                                     input_data) -> List[np.ndarray]:
+                                     input_data,
+                                     branch_indices=None) -> List[np.ndarray]:
         """Run every branch on the same ``input_data`` and return a list
         of normalised ``(N, k)`` matrices.
 
@@ -214,6 +215,22 @@ class RAFEnsembler:
         predictions. Normalisation is delegated to
         :meth:`_normalize_branch_output` (see its docstring for the
         format-collision story).
+
+        Args:
+            branches: list of FEDOT pipelines built by
+                :meth:`_fit_single_branch`.
+            input_data: row-aligned ``InputData``-shaped duck.
+            branch_indices: optional list of integer indices that maps
+                each branch to the source name it was fitted with
+                (``f'{prefix}/{idx}'``). Required when ``branches`` is
+                a sub-slice of ``self._branches`` (e.g. boosting calls
+                this with a single branch from round ``m``); without
+                it the helper assumes the branches are passed in their
+                original 0..N-1 order. Mismatches manifest as
+                ``KeyError: 'data_source_<type>/0'`` from FEDOT's
+                preprocessor, since the source name in the MultiModal
+                envelope no longer matches the one the branch was fit
+                with.
         """
         branch_mode = 'full_probs' if self.problem == 'classification' else 'labels'
         target = (np.asarray(input_data.target)
@@ -221,8 +238,15 @@ class RAFEnsembler:
         features = np.asarray(input_data.features)
         idx_arr = np.asarray(getattr(input_data, 'idx', np.arange(features.shape[0])))
 
+        if branch_indices is None:
+            branch_indices = list(range(len(branches)))
+        elif len(branch_indices) != len(branches):
+            raise ValueError(
+                f'branch_indices ({len(branch_indices)}) and branches '
+                f'({len(branches)}) must have the same length')
+
         columns: List[np.ndarray] = []
-        for idx, branch in enumerate(branches):
+        for idx, branch in zip(branch_indices, branches):
             source_name = f'{self.source_prefix}/{idx}'
             fold = InputData(
                 idx=idx_arr, features=features, target=target,

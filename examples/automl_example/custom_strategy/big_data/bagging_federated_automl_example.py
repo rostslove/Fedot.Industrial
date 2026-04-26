@@ -1,4 +1,6 @@
-"""Example: Federated AutoML with PEA-Bag (bagging) ensembling.
+"""Example: Federated AutoML with PEA-Bag (bagging) ensembling on the
+Adult Census Income dataset (same loader as
+``clustered_federated_automl_example.py``).
 
 The branches are still trained on disjoint partitions (any of the
 partitioners listed in ``partitioning_method`` works), but their
@@ -11,27 +13,63 @@ Tunable ``ensembling_params`` for ``'bagging'``:
 * ``voting``: ``'soft'`` (default; mean of class probabilities) or
   ``'hard'`` (majority vote on argmax labels).
 """
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
 from fedot_ind.core.architecture.pipelines.abstract_pipeline import ApiTemplate
 from fedot_ind.core.repository.config_repository import (
     DEFAULT_AUTOML_LEARNING_CONFIG,
     DEFAULT_CLF_AUTOML_CONFIG,
     DEFAULT_COMPUTE_CONFIG,
 )
-from fedot_ind.tools.synthetic.ts_datasets_generator import TimeSeriesDatasetsGenerator
+
+DATASET_PATH = r'examples/automl_example/custom_strategy/big_data/data/adult.csv'
 
 
-def run_bagging_federated_automl_example(timeout: int = 10,
-                                          voting: str = 'soft'):
+def _load_adult(path: str, test_size: float = 0.3, random_state: int = 42):
+    """Load and preprocess Adult Census Income from CSV.
+
+    Mirrors the loader in ``clustered_federated_automl_example.py`` so
+    every PEA strategy in this folder runs on the same data.
+    """
+    df = pd.read_csv(path)
+    df = df.replace('?', np.nan).dropna()
+
+    target_col = 'income'
+    df[target_col] = df[target_col].str.strip().map({'<=50K': 0, '>50K': 1})
+    df = df.dropna(subset=[target_col])
+    df = df.head(3000)
+    y = df[target_col].astype(int).values
+    X = df.drop(columns=[target_col])
+
+    cat_cols = ['workclass', 'education', 'marital.status', 'occupation',
+                'relationship', 'race', 'sex', 'native.country']
+    X = pd.get_dummies(X, columns=cat_cols, drop_first=True).astype(np.float32)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size,
+        random_state=random_state, stratify=y)
+    return (X_train, y_train), (X_test, y_test)
+
+
+def run_bagging_federated_automl_example(timeout: int = 20,
+                                          voting: str = 'soft',
+                                          partitioning_method: str = 'sequential'):
     industrial_config = {
         'problem': 'classification',
         'learning_strategy': 'federated_automl',
         'strategy': 'federated_automl',
         'strategy_params': {
             'timeout': timeout,
-            'data_type': 'time_series',
+            'data_type': 'table',
             'problem': 'classification',
-            'partitioning_method': 'sequential',
-            'partitioning_params': {'random_state': 42},
+            'n_jobs': 1,
+            'partitioning_method': partitioning_method,
+            'partitioning_params': {
+                'random_state': 42,
+                'scale_features': True,
+            },
             'ensembling_method': 'bagging',
             'ensembling_params': {'voting': voting},
         },
@@ -39,7 +77,8 @@ def run_bagging_federated_automl_example(timeout: int = 10,
 
     learning_config = {
         'learning_strategy': 'from_scratch',
-        'learning_strategy_params': {**DEFAULT_AUTOML_LEARNING_CONFIG, 'timeout': timeout},
+        'learning_strategy_params': {**DEFAULT_AUTOML_LEARNING_CONFIG,
+                                     'timeout': timeout, 'n_jobs': 1},
         'optimisation_loss': {'quality_loss': 'f1'},
     }
 
@@ -50,14 +89,7 @@ def run_bagging_federated_automl_example(timeout: int = 10,
         'compute_config': DEFAULT_COMPUTE_CONFIG,
     }
 
-    train_data, test_data = TimeSeriesDatasetsGenerator(
-        num_samples=1800,
-        task='classification',
-        max_ts_len=50,
-        binary=True,
-        test_size=0.5,
-        multivariate=False,
-    ).generate_data()
+    train_data, test_data = _load_adult(DATASET_PATH, test_size=0.3)
     dataset_dict = dict(train_data=train_data, test_data=test_data)
     return ApiTemplate(
         api_config=api_config,
@@ -66,5 +98,6 @@ def run_bagging_federated_automl_example(timeout: int = 10,
 
 
 if __name__ == '__main__':
-    result = run_bagging_federated_automl_example(timeout=2, voting='soft')
+    result = run_bagging_federated_automl_example(
+        timeout=20, voting='soft', partitioning_method='sequential')
     print(result)

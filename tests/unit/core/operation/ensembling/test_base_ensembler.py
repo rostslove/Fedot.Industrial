@@ -73,7 +73,9 @@ class FakeRAF:
             max_depth=3, random_state=42).fit(features, target.ravel())
         return FakeBranch(model, self.problem)
 
-    def _collect_branch_predictions(self, branches, input_data):
+    def _collect_branch_predictions(self, branches, input_data,
+                                     branch_indices=None):
+        del branch_indices
         cols = []
         n = int(np.asarray(input_data.features).shape[0])
         for branch in branches:

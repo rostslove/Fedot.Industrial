@@ -221,7 +221,7 @@ class PEABoostEnsembler(BaseEnsembler):
         self.n_classes_: Optional[int] = None
         self.classes_: Optional[np.ndarray] = None
 
-    def fit(self, raf, train_data, partitioner) -> None:  # noqa: ARG002
+    def fit(self, raf, train_data, partitioner) -> None: 
         features = np.asarray(train_data.features)
         target = np.asarray(train_data.target).ravel()
         n_samples = features.shape[0]
@@ -250,10 +250,7 @@ class PEABoostEnsembler(BaseEnsembler):
         for m in range(self.n_splits):
             sampled_idx = rng.choice(n_samples, size=n_samples,
                                      replace=True, p=weights)
-            # Guarantee every class is represented in the bootstrap so
-            # the FEDOT branch's ``classes_`` matches the global class
-            # space (otherwise its ``predict_proba`` columns no longer
-            # align with ``self.classes_`` and the SAMME vote breaks).
+
             present = set(target_int[sampled_idx].tolist())
             missing = [c for c in range(self.n_classes_) if c not in present]
             if missing:
@@ -272,7 +269,7 @@ class PEABoostEnsembler(BaseEnsembler):
                     f'stopping early')
                 break
 
-            preds_int = self._branch_labels(raf, branch, features, target)
+            preds_int = self._branch_labels(raf, branch, m, features, target)
             miss = (preds_int != target_int).astype(np.float64)
             err_m = float(np.average(miss, weights=weights))
             err_m = float(np.clip(err_m, 1e-12, 1.0 - 1e-12))
@@ -318,7 +315,7 @@ class PEABoostEnsembler(BaseEnsembler):
                     f'PEA-Boost round {m}: branch fit failed ({err!r}); '
                     f'stopping early')
                 break
-            pred = self._branch_regression(raf, branch, features)
+            pred = self._branch_regression(raf, branch, m, features)
             raf._branches.append(branch)
             self.alphas_.append(self.learning_rate)
             residuals = residuals - self.learning_rate * pred
@@ -340,8 +337,9 @@ class PEABoostEnsembler(BaseEnsembler):
     def _predict_classification(self, raf, test_data, output_mode):
         n_classes = self.n_classes_ or raf._n_classes or 2
         votes = np.zeros((self._n_test_rows(test_data), n_classes), dtype=np.float64)
-        for branch, alpha in zip(raf._branches, self.alphas_):
-            preds_int = self._branch_labels(raf, branch, test_data.features,
+        for idx, (branch, alpha) in enumerate(zip(raf._branches, self.alphas_)):
+            preds_int = self._branch_labels(raf, branch, idx,
+                                             test_data.features,
                                              getattr(test_data, 'target', None))
             for cls in range(n_classes):
                 votes[preds_int == cls, cls] += alpha
@@ -362,18 +360,21 @@ class PEABoostEnsembler(BaseEnsembler):
     def _predict_regression(self, raf, test_data):
         features = np.asarray(test_data.features)
         out = np.full(features.shape[0], self.init_value_, dtype=np.float64)
-        for branch, alpha in zip(raf._branches, self.alphas_):
-            pred = self._branch_regression(raf, branch, features)
+        for idx, (branch, alpha) in enumerate(zip(raf._branches, self.alphas_)):
+            pred = self._branch_regression(raf, branch, idx, features)
             out = out + alpha * pred
         return out
 
-    def _branch_labels(self, raf, branch, features, target) -> np.ndarray:
+    def _branch_labels(self, raf, branch, branch_idx, features,
+                        target) -> np.ndarray:
         """Run a single classification branch on ``features`` and return
-        a 1-D vector of class indices into ``self.classes_``."""
+        a 1-D vector of class indices into ``self.classes_``.
+        """
         td = _SimpleData(
             features=np.asarray(features),
             target=(np.asarray(target) if target is not None else None))
-        cols = raf._collect_branch_predictions([branch], td)
+        cols = raf._collect_branch_predictions(
+            [branch], td, branch_indices=[branch_idx])
         probs = cols[0]
         labels = self._probs_to_labels(probs)
         if self.classes_ is None:
@@ -387,9 +388,13 @@ class PEABoostEnsembler(BaseEnsembler):
         return idx.astype(int)
 
     @staticmethod
-    def _branch_regression(raf, branch, features) -> np.ndarray:
+    def _branch_regression(raf, branch, branch_idx, features) -> np.ndarray:
+        """Run a single regression branch and return a 1-D prediction
+        vector. ``branch_idx`` selects the matching FEDOT source name;
+        see :meth:`_branch_labels` for the rationale."""
         td = _SimpleData(features=np.asarray(features), target=None)
-        cols = raf._collect_branch_predictions([branch], td)
+        cols = raf._collect_branch_predictions(
+            [branch], td, branch_indices=[branch_idx])
         out = cols[0]
         if out.ndim == 2 and out.shape[1] == 1:
             return out[:, 0]
@@ -430,12 +435,8 @@ class PEAStackEnsembler(BaseEnsembler):
             for idx, (f, t) in enumerate(zip(features_splits, target_splits))
         ]
 
-        # 2. every branch predicts on the FULL training set -> row-aligned
-        #    stacked feature matrix. See ``RAFEnsembler.fit`` for the long
-        #    history of why partition-aligned stacking collapses the head.
         stacked_train = raf._stack_predictions(raf._branches, train_data)
 
-        # 3. fit the head on (stacked_train, full_target).
         head_op = self.head or raf.head
         raf._head = self._fit_head(raf, head_op, stacked_train, train_data.target)
         raf.current_pipeline = raf._head
